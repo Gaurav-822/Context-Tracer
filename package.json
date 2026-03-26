@@ -1,0 +1,159 @@
+{
+  "name": "api-graph-visualizer",
+  "displayName": "API Graph Visualizer",
+  "description": "Interactive visualization of API route dependency graphs",
+  "version": "0.1.0",
+  "publisher": "gauravbhushan",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "apiGraphVisualizer.open",
+        "title": "API Graph: Open Visualizer",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "apiGraphVisualizer.selectFile",
+        "title": "API Graph: Select JSON File"
+      },
+      {
+        "command": "apiGraphVisualizer.focusInGraph",
+        "title": "Focus in API Graph",
+        "icon": "$(search-focus)"
+      },
+      {
+        "command": "apiGraphVisualizer.buildFromCurrentFile",
+        "title": "Build Graph from File",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "apiGraphVisualizer.buildFromResource",
+        "title": "API Graph: Build Import Graph",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "apiGraphVisualizer.pickFileForGraph",
+        "title": "API Graph: Browse File"
+      },
+      {
+        "command": "apiGraphVisualizer.loadImportRoute",
+        "title": "API Graph: Load Import"
+      },
+      {
+        "command": "apiGraphVisualizer.toggleFileGraphLlm",
+        "title": "API Graph: Toggle LLM"
+      },
+      {
+        "command": "apiGraphVisualizer.softDeleteFromBuildFromFile",
+        "title": "Soft Delete"
+      },
+      {
+        "command": "apiGraphVisualizer.hardDeleteFromBuildFromFile",
+        "title": "Hard Delete"
+      },
+      {
+        "command": "apiGraphVisualizer.restoreFromBuildFromFile",
+        "title": "Restore"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "apiGraphVisualizer.softDeleteFromBuildFromFile",
+        "key": "ctrl+Delete",
+        "mac": "cmd+Delete",
+        "when": "view == apiGraphVisualizer.fileDropTree"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "apiGraphVisualizer.buildFromResource",
+          "when": "resourceExtname == '.ts' || resourceExtname == '.tsx' || resourceExtname == '.js' || resourceExtname == '.jsx' || resourceExtname == '.mjs' || resourceExtname == '.cjs'",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "apiGraphVisualizer.softDeleteFromBuildFromFile",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == fileItem",
+          "group": "1_modification"
+        },
+        {
+          "command": "apiGraphVisualizer.hardDeleteFromBuildFromFile",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == fileItem",
+          "group": "1_modification"
+        },
+        {
+          "command": "apiGraphVisualizer.restoreFromBuildFromFile",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == softDeletedFile",
+          "group": "1_modification"
+        },
+        {
+          "command": "apiGraphVisualizer.hardDeleteFromBuildFromFile",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == softDeletedFile",
+          "group": "1_modification"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "apiGraphVisualizer.focusInGraph",
+          "when": "editorTextFocus",
+          "group": "2_editor"
+        },
+        {
+          "command": "apiGraphVisualizer.buildFromCurrentFile",
+          "when": "editorTextFocus",
+          "group": "2_editor"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "api-graph-sidebar",
+          "title": "API Graph",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "api-graph-sidebar": [
+        {
+          "type": "tree",
+          "id": "apiGraphVisualizer.fileDropTree",
+          "name": "Build From File"
+        },
+        {
+          "type": "webview",
+          "id": "apiGraphVisualizer.traceView",
+          "name": "Trace Graph"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js --production",
+    "watch": "node esbuild.js --watch",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "vis-data": "^7.1.9",
+    "vis-network": "^9.1.9"
+  }
+}
