@@ -1,21 +1,128 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-system, sans-serif; }
-#mynetwork { width: 100%; height: 100vh; background: #0d1117; }
+html, body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: #0d1117;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, sans-serif;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
 
-.vis-tooltip {
-  z-index: 99999 !important;
-  font-family: 'Inter', -apple-system, sans-serif !important;
-  background: rgba(22, 27, 34, 0.95) !important;
-  color: #e6edf3 !important;
-  border: 1px solid rgba(255,255,255,0.1) !important;
-  border-radius: 8px !important;
-  padding: 12px 16px !important;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4) !important;
-  white-space: normal !important;
-  max-width: 420px !important;
-  word-wrap: break-word !important;
-  font-size: 13px !important;
-  line-height: 1.5 !important;
+/* One VS Code webview: tabs + canvas fill height so vis-network gets a real size (fixes zoom/pan). */
+#graph-app {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  width: 100%;
+  position: relative;
+  z-index: 1;
+}
+
+.graph-tab-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  padding: 6px 8px;
+  background: #010409;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  overflow-x: auto;
+  align-items: center;
+  min-height: 36px;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.graph-tab-bar::-webkit-scrollbar { display: none; }
+
+.graph-tab {
+  flex: 0 0 auto;
+  max-width: 260px;
+  padding: 5px 8px 5px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  color: #8b949e;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.graph-tab-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.graph-tab:hover {
+  background: rgba(255,255,255,0.08);
+  color: #c9d1d9;
+}
+.graph-tab.active {
+  background: rgba(88,166,255,0.15);
+  border-color: rgba(88,166,255,0.35);
+  color: #58a6ff;
+  font-weight: 600;
+}
+.graph-tab.graph-tab--backtrack {
+  border-color: rgba(234,179,8,0.45);
+  background: rgba(234,179,8,0.12);
+  color: #fbbf24;
+}
+.graph-tab.graph-tab--backtrack.active {
+  background: rgba(234,179,8,0.22);
+  border-color: rgba(250,204,21,0.55);
+  color: #fde047;
+}
+.graph-tab-dirty {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fbbf24;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+  margin-right: 4px;
+}
+.graph-tab-close {
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.graph-tab-close:hover {
+  color: #e6edf3;
+  background: rgba(255,255,255,0.14);
+}
+
+.graph-canvas-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  background: #0d1117;
+  touch-action: none;
+}
+.graph-canvas-wrap .vis-network {
+  outline: none;
+}
+
+/* vis-network hover popup (class on Popup only) — disabled; details are click-only. */
+.graph-canvas-wrap .vis-tooltip {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 #graph-loading-overlay {
@@ -24,6 +131,11 @@ body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-syste
   display: none; flex-direction: column;
   justify-content: center; align-items: center;
   color: #8b949e; font-family: 'Inter', -apple-system, sans-serif;
+  pointer-events: none;
+}
+/* Children default to pointer-events: auto and would steal pan/zoom from the graph */
+#graph-loading-overlay * {
+  pointer-events: none !important;
 }
 #graph-loading-overlay.visible { display: flex; }
 #graph-loading-overlay .spinner {
@@ -118,7 +230,8 @@ body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-syste
   font-family: 'Inter', -apple-system, sans-serif;
   font-weight: 600;
   cursor: pointer;
-  z-index: 1000;
+  z-index: 1002;
+  pointer-events: auto;
   box-shadow: 0 2px 8px rgba(0,0,0,0.3);
   transition: background 0.15s, border-color 0.15s, color 0.15s;
   letter-spacing: 0.2px;
@@ -137,6 +250,7 @@ body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-syste
   border-radius: 10px; z-index: 1000; color: #8b949e;
   font-family: 'Inter', -apple-system, sans-serif; font-size: 12px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  pointer-events: none;
 }
 #legend .item { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 #legend .item:last-child { margin-bottom: 0; }
@@ -149,6 +263,7 @@ body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-syste
   border-radius: 10px; z-index: 1000; color: #8b949e;
   font-family: 'Inter', -apple-system, sans-serif; font-size: 12px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  pointer-events: none;
 }
 #stats span { color: #e6edf3; font-weight: 600; }
 
@@ -179,4 +294,80 @@ body { background: #0d1117; overflow: hidden; font-family: 'Inter', -apple-syste
 #trace-expand-close:hover { background: rgba(239,83,80,0.35); }
 #trace-expand-graph {
   flex: 1; min-height: 0; background: #0d1117; border-radius: 0 0 12px 12px;
+}
+
+/* ── Node info (click) popover ───────────────────────────────────────── */
+.node-info-popover {
+  position: fixed;
+  z-index: 4000;
+  width: min(380px, calc(100vw - 24px));
+  max-height: min(70vh, 480px);
+  overflow: auto;
+  background: rgba(22, 27, 34, 0.98);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 12px 14px 14px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+  font-family: 'Inter', -apple-system, sans-serif;
+  pointer-events: auto;
+}
+.node-info-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #8b949e;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.node-info-close:hover {
+  background: rgba(255,255,255,0.08);
+  color: #e6edf3;
+}
+.node-info-heading {
+  font-size: 13px;
+  font-weight: 700;
+  color: #e6edf3;
+  padding-right: 28px;
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+.node-info-path {
+  font-size: 11px;
+  color: #6e7681;
+  margin-bottom: 10px;
+  word-break: break-all;
+  line-height: 1.35;
+}
+.node-info-body {
+  font-size: 12px;
+  color: #c9d1d9;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  margin-bottom: 12px;
+}
+.node-info-backtrack {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(88,166,255,0.35);
+  background: rgba(88,166,255,0.12);
+  color: #58a6ff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+}
+.node-info-backtrack:hover {
+  background: rgba(88,166,255,0.22);
+  border-color: rgba(88,166,255,0.55);
+}
+.node-info-backtrack:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }

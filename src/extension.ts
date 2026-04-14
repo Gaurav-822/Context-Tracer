@@ -1,31 +1,27 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { buildGraphSnapshots } from './builder';
 import { buildFileGraph } from './fileGraphBuilder';
-import { FileDropTreeProvider, toFileNamedBasename } from './fileDropTree';
-import { GraphPanel } from './graphPanel';
-import { TraceSidebarProvider } from './traceSidebar';
+import { FileDropTreeProvider, relPathFromWorkspaceTreeId, toFileNamedBasename } from './fileDropTree';
+import { computeImporterClosureFromOpenEditors } from './backtrackClosure';
+import { mergeBacktrackIntoRoute } from './backtrackMerge';
+import { GraphPanel, GraphPanelLoadMode, UpsertSessionMessage } from './graphPanel';
 import { computeGitHeatByPath } from './gitHeat';
-import { ApiJsonData, GraphData } from './types';
+import { GraphData } from './types';
+
+/** Latest graph JSON in memory per open Import graph tab (for backtrack save). */
+const graphDataByJsonPath = new Map<string, GraphData>();
 
 let lastJsonPath: string | undefined;
-let traceSidebarProvider: TraceSidebarProvider;
 let fileDropProvider: FileDropTreeProvider;
 let fileDropTreeView: vscode.TreeView<vscode.TreeItem> | undefined;
-let lastFileGraphUseLlm = false;
-let traceGraphUseLlm = false;
-let autoFollowEnabled = false;
-let lastApiGraphMeta: { routeNames: string[]; nodeIds: string[] } | null = null;
 
 export function activate(context: vscode.ExtensionContext) {
-  traceSidebarProvider = new TraceSidebarProvider(context.extensionUri);
-
   fileDropProvider = new FileDropTreeProvider(
     context,
     (filePathOrUri, useLlm) => {
-      const pathOrUri = typeof filePathOrUri === 'string' ? filePathOrUri : filePathOrUri.fsPath;
-      void buildGraphFromFile(context, pathOrUri, useLlm);
+      const fp = typeof filePathOrUri === 'string' ? filePathOrUri : filePathOrUri.fsPath;
+      void buildGraphFromFile(context, fp, useLlm);
     },
     (paths, useLlm) => {
       for (const p of paths) {
@@ -39,164 +35,56 @@ export function activate(context: vscode.ExtensionContext) {
     dragAndDropController: fileDropProvider,
   });
   context.subscriptions.push(fileDropTreeView);
-
   fileDropProvider.refreshFromFilesNamed();
 
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      TraceSidebarProvider.viewType,
-      traceSidebarProvider
-    )
-  );
-
-  traceSidebarProvider.setOnCommandFromSidebar((msg) => {
-    const type = msg.type as string;
-
-    if (type === 'cmd:runMapper') {
-      runMapperInTerminal(context);
-      return;
-    }
-
-    if (type === 'cmd:openFile') {
-      openFileInEditor(msg.filePath as string);
-      return;
-    }
-
-    if (type === 'cmd:pickFileForGraph') {
-      lastFileGraphUseLlm = !!(msg.useLlm as boolean);
-      void pickFileAndBuildGraph(context, lastFileGraphUseLlm);
-      return;
-    }
-
-    if (type === 'cmd:buildFileGraph') {
-      lastFileGraphUseLlm = !!(msg.useLlm as boolean);
-      buildGraphFromFile(context, msg.filePath as string, lastFileGraphUseLlm);
-      return;
-    }
-
-    if (type === 'cmd:useLlmState') {
-      lastFileGraphUseLlm = !!(msg.useLlm as boolean);
-      return;
-    }
-
-    if (type === 'cmd:toggleFileGraphLlm') {
-      fileDropProvider.toggleUseLlm();
-      return;
-    }
-
-    if (type === 'cmd:toggleTraceGraphLlm') {
-      traceGraphUseLlm = !traceGraphUseLlm;
-      traceSidebarProvider.updateUseLlmState(traceGraphUseLlm);
-      return;
-    }
-
-    if (type === 'cmd:autoFollowToggle') {
-      autoFollowEnabled = !!(msg.on as boolean);
-      traceSidebarProvider.updateAutoFollowState(autoFollowEnabled);
-      return;
-    }
-
-    GraphPanel.currentPanel?.handleSidebarCommand(msg);
-  });
-
-  traceSidebarProvider.setOnSidebarOpened(() => {
-    const jsonExists = !!findJsonInWorkspace();
-    traceSidebarProvider.updateGenerateButtonState(jsonExists);
-    traceSidebarProvider.updateUseLlmState(traceGraphUseLlm);
-    traceSidebarProvider.updateAutoFollowState(autoFollowEnabled);
-    fileDropProvider.refreshFromFilesNamed();
-    if (GraphPanel.currentPanel) {
-      GraphPanel.currentPanel.reveal();
-    } else {
-      openVisualizer(context);
-    }
-  });
-
-  traceSidebarProvider.setOnSidebarReady(() => {
-    const jsonExists = !!findJsonInWorkspace();
-    traceSidebarProvider.updateGenerateButtonState(jsonExists);
-    traceSidebarProvider.updateUseLlmState(traceGraphUseLlm);
-    traceSidebarProvider.updateAutoFollowState(autoFollowEnabled);
-    if (GraphPanel.currentPanel) {
-      GraphPanel.currentPanel.requestGraphMeta();
-    }
-  });
-
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (!autoFollowEnabled || !editor || !GraphPanel.currentPanel) return;
-      const uri = editor.document.uri;
-      if (uri.scheme !== 'file') return;
-      const ext = path.extname(uri.fsPath).toLowerCase();
-      if (!['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) return;
-
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders?.length) return;
-
-      let relativePath: string = uri.fsPath;
-      for (const folder of workspaceFolders) {
-        const folderPath = folder.uri.fsPath;
-        if (uri.fsPath.startsWith(folderPath + path.sep) || uri.fsPath === folderPath) {
-          relativePath = path.relative(folderPath, uri.fsPath);
-          break;
-        }
+    fileDropTreeView.onDidChangeVisibility((e) => {
+      if (e.visible) {
+        fileDropProvider.refreshFromFilesNamed();
+        GraphPanel.instance?.requestGraphMeta();
       }
-      relativePath = relativePath.replace(/\\/g, '/');
-      GraphPanel.currentPanel.focusNodeInGraph(relativePath, true);
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('apiGraphVisualizer.open', () => {
-      openVisualizer(context);
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('apiGraphVisualizer.selectFile', () => {
-      selectAndOpenFile(context);
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('apiGraphVisualizer.focusInGraph', () => {
-      focusCurrentFileInGraph(context);
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('apiGraphVisualizer.buildFromCurrentFile', () => {
-      buildFromCurrentFile(context);
-    })
-  );
-
-  context.subscriptions.push(
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.open', () => { void openVisualizer(context); }),
+    vscode.commands.registerCommand('apiGraphVisualizer.focusInGraph', () => focusCurrentFileInGraph()),
+    vscode.commands.registerCommand('apiGraphVisualizer.buildFromCurrentFile', () => { void buildFromCurrentFile(context); }),
     vscode.commands.registerCommand('apiGraphVisualizer.buildFromResource', (resource: vscode.Uri) => {
-      if (resource?.fsPath) {
-        void buildGraphFromFile(context, resource.fsPath, false);
-      }
-    })
-  );
-
-  context.subscriptions.push(
+      if (resource?.fsPath) void buildGraphFromFile(context, resource.fsPath, false);
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.pickFileForGraph', () => {
       void pickFileAndBuildGraph(context, fileDropProvider.useLlm);
-    })
-  );
-
-  context.subscriptions.push(
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.toggleFileGraphLlm', () => {
       fileDropProvider.toggleUseLlm();
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.openBacktrackedGraphsFolder', async () => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+      if (!root) {
+        vscode.window.showWarningMessage('Open a workspace to use backtracked graphs.');
+        return;
+      }
+      const dir = vscode.Uri.joinPath(root, 'visualizer', 'backtracked');
+      try {
+        await vscode.workspace.fs.createDirectory(dir);
+      } catch {
+        /* exists */
+      }
+      await vscode.commands.executeCommand('revealInExplorer', dir);
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.loadSavedGraph', async (resource?: vscode.Uri) => {
+      if (!resource?.fsPath) return;
+      await loadAndShowFileGraph(context, resource.fsPath);
     })
   );
 
   const getSelectedFilePaths = (): string[] => {
     const paths: string[] = [];
-    if (fileDropTreeView) {
-      for (const sel of fileDropTreeView.selection) {
-        if ((sel.contextValue === 'fileItem' || sel.contextValue === 'softDeletedFile') && typeof sel.label === 'string') {
-          paths.push(sel.label);
-        }
+    if (!fileDropTreeView) return paths;
+    for (const sel of fileDropTreeView.selection) {
+      if (sel.contextValue === 'workspaceFile' && typeof sel.id === 'string') {
+        const rp = relPathFromWorkspaceTreeId(sel.id);
+        if (rp) paths.push(rp);
+      } else if (sel.contextValue === 'softDeletedFile' && typeof sel.label === 'string') {
+        paths.push(sel.label);
       }
     }
     return paths;
@@ -204,22 +92,43 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('apiGraphVisualizer.softDeleteFromBuildFromFile', (item?: vscode.TreeItem) => {
-      const paths = item?.contextValue === 'fileItem' && typeof item.label === 'string'
-        ? [item.label]
-        : getSelectedFilePaths();
-      const fileOnly = paths.filter((p) => fileDropProvider.getDroppedFiles().includes(p));
+      let paths: string[] = [];
+      if (item?.contextValue === 'workspaceFile' && typeof item.id === 'string') {
+        const rp = relPathFromWorkspaceTreeId(item.id);
+        if (rp) paths = [rp];
+      } else if (item?.contextValue === 'softDeletedFile' && typeof item.label === 'string') {
+        paths = [item.label];
+      } else {
+        paths = getSelectedFilePaths();
+      }
+      const selectionHasWorkspaceFile =
+        !!fileDropTreeView?.selection.some((s) => s.contextValue === 'workspaceFile');
+      const fileOnly = paths.filter(
+        (p) =>
+          selectionHasWorkspaceFile ||
+          fileDropProvider.getDroppedFiles().includes(p) ||
+          fileDropProvider.hasSoftDeleted(p)
+      );
       if (fileOnly.length > 0) fileDropProvider.softDelete(fileOnly);
-    })
-  );
-
-  context.subscriptions.push(
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.hardDeleteFromBuildFromFile', async (item?: vscode.TreeItem) => {
-      const paths = item?.contextValue === 'fileItem' && typeof item.label === 'string'
-        ? [item.label]
-        : item?.contextValue === 'softDeletedFile' && typeof item.label === 'string'
-          ? [item.label]
-          : getSelectedFilePaths();
-      const fileOnly = paths.filter((p) => fileDropProvider.getDroppedFiles().includes(p) || fileDropProvider.hasSoftDeleted(p));
+      let paths: string[];
+      if (item?.contextValue === 'workspaceFile' && typeof item.id === 'string') {
+        const rp = relPathFromWorkspaceTreeId(item.id);
+        paths = rp ? [rp] : [];
+      } else if (item?.contextValue === 'softDeletedFile' && typeof item.label === 'string') {
+        paths = [item.label];
+      } else {
+        paths = getSelectedFilePaths();
+      }
+      const selectionHasWorkspaceFile =
+        !!fileDropTreeView?.selection.some((s) => s.contextValue === 'workspaceFile');
+      const fileOnly = paths.filter(
+        (p) =>
+          selectionHasWorkspaceFile ||
+          fileDropProvider.getDroppedFiles().includes(p) ||
+          fileDropProvider.hasSoftDeleted(p)
+      );
       if (fileOnly.length === 0) return;
       const confirm = await vscode.window.showWarningMessage(
         `Permanently delete ${fileOnly.length} file graph(s) and remove JSON from disk?`,
@@ -227,64 +136,42 @@ export function activate(context: vscode.ExtensionContext) {
         'Delete'
       );
       if (confirm !== 'Delete') return;
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders?.length) return;
-      const projectRoot = workspaceFolders[0].uri.fsPath;
-      const filesNamedDir = path.join(projectRoot, 'visualizer', 'files_named');
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) return;
+      const filesNamedDir = path.join(root, 'visualizer', 'files_named');
       for (const relPath of fileOnly) {
         const jsonPath = path.join(filesNamedDir, toFileNamedBasename(relPath));
-        try {
-          if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
-        } catch {
-          /* ignore */
-        }
+        try { if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath); } catch { /* ignore */ }
       }
       fileDropProvider.removeCompletely(fileOnly);
-    })
-  );
-
-  context.subscriptions.push(
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.restoreFromBuildFromFile', (item?: vscode.TreeItem) => {
-      const paths = item?.contextValue === 'softDeletedFile' && typeof item.label === 'string'
-        ? [item.label]
-        : getSelectedFilePaths();
+      const paths = item?.contextValue === 'softDeletedFile' && typeof item.label === 'string' ? [item.label] : getSelectedFilePaths();
       const toRestore = paths.filter((p) => fileDropProvider.hasSoftDeleted(p));
       if (toRestore.length > 0) fileDropProvider.revive(toRestore);
-    })
-  );
-
-  context.subscriptions.push(
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.loadImportRoute', async (_: unknown, routeId?: string) => {
       if (!routeId) return;
       const relPath = routeId.replace(/^Import:\s*/, '');
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders?.length) return;
-      const projectRoot = workspaceFolders[0].uri.fsPath;
-      const jsonPath = path.join(projectRoot, 'visualizer', 'files_named', toFileNamedBasename(relPath));
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) return;
+      const jsonPath = path.join(root, 'visualizer', 'files_named', toFileNamedBasename(relPath));
       if (fs.existsSync(jsonPath)) {
         await loadAndShowFileGraph(context, jsonPath);
       } else {
-        GraphPanel.currentPanel?.handleSidebarCommand({ type: 'cmd:loadRoute', routeId });
-        const absPath = path.join(projectRoot, relPath);
-        if (fs.existsSync(absPath)) {
-          void buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
-        }
+        const absPath = path.join(root, relPath);
+        if (fs.existsSync(absPath)) void buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
       }
     })
   );
 
-  autoDetectJsonFile(context);
+  autoDetectFileGraphs(context);
 }
 
 async function buildFromCurrentFile(context: vscode.ExtensionContext): Promise<void> {
   const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    vscode.window.showInformationMessage('Open a file first to build its import graph.');
-    return;
-  }
-  const uri = editor.document.uri;
-  if (uri.scheme !== 'file') return;
-  const filePath = uri.fsPath;
+  if (!editor || editor.document.uri.scheme !== 'file') return;
+  const filePath = editor.document.uri.fsPath;
   const ext = path.extname(filePath).toLowerCase();
   if (!['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
     vscode.window.showWarningMessage('Select a TypeScript or JavaScript file.');
@@ -293,57 +180,20 @@ async function buildFromCurrentFile(context: vscode.ExtensionContext): Promise<v
   await buildGraphFromFile(context, filePath, false);
 }
 
-function focusCurrentFileInGraph(_context: vscode.ExtensionContext): void {
+function focusCurrentFileInGraph(): void {
   const editor = vscode.window.activeTextEditor;
-  if (!editor) return;
-
-  const uri = editor.document.uri;
-  if (uri.scheme !== 'file') return;
-
+  if (!editor || editor.document.uri.scheme !== 'file') return;
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders?.length) return;
-
-  let relativePath: string = uri.fsPath;
+  let relativePath = editor.document.uri.fsPath;
   for (const folder of workspaceFolders) {
     const folderPath = folder.uri.fsPath;
-    if (uri.fsPath.startsWith(folderPath + path.sep) || uri.fsPath === folderPath) {
-      relativePath = path.relative(folderPath, uri.fsPath);
+    if (relativePath.startsWith(folderPath + path.sep) || relativePath === folderPath) {
+      relativePath = path.relative(folderPath, relativePath);
       break;
     }
   }
-  relativePath = relativePath.replace(/\\/g, '/');
-
-  if (!GraphPanel.currentPanel) {
-    vscode.window.showInformationMessage('Open the API Graph first to focus this file.');
-    return;
-  }
-
-  GraphPanel.currentPanel.focusNodeInGraph(relativePath);
-}
-
-function runMapperInTerminal(context: vscode.ExtensionContext): void {
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders || workspaceFolders.length === 0) {
-    vscode.window.showErrorMessage('No workspace folder open.');
-    return;
-  }
-
-  const projectRoot = workspaceFolders[0].uri.fsPath;
-  const scriptPath = path.join(context.extensionPath, 'dist', 'scripts', 'makeMap.ts');
-
-  if (!fs.existsSync(scriptPath)) {
-    vscode.window.showErrorMessage('Mapper script not found. Rebuild the extension.');
-    return;
-  }
-
-  const terminal = vscode.window.createTerminal({
-    name: 'API Graph Mapper',
-    cwd: projectRoot,
-    env: { PROJECT_ROOT: projectRoot },
-  });
-  terminal.show();
-  const llmFlag = traceGraphUseLlm ? ' --llm' : '';
-  terminal.sendText(`npx ts-node "${scriptPath}"${llmFlag}`);
+  GraphPanel.instance?.focusNodeInGraph(relativePath.replace(/\\/g, '/'));
 }
 
 function openFileInEditor(relativePath: string): void {
@@ -411,35 +261,17 @@ function openFileInEditor(relativePath: string): void {
   );
 }
 
-async function openVisualizer(context: vscode.ExtensionContext): Promise<void> {
-  if (lastJsonPath && fs.existsSync(lastJsonPath)) {
-    await loadAndShowGraph(context, lastJsonPath);
-    return;
+function getPreferredProjectRoot(fsPath?: string): string | undefined {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) return undefined;
+  if (fsPath) {
+    const norm = path.normalize(fsPath);
+    for (const f of folders) {
+      const r = f.uri.fsPath;
+      if (norm === r || norm.startsWith(r + path.sep)) return r;
+    }
   }
-
-  const detected = findJsonInWorkspace();
-  if (detected) {
-    lastJsonPath = detected;
-    await loadAndShowGraph(context, detected);
-    return;
-  }
-
-  vscode.window.showInformationMessage(
-    'No API graph found. Click "Update Graph" to generate from your workspace.'
-  );
-}
-
-async function selectAndOpenFile(context: vscode.ExtensionContext): Promise<void> {
-  const uris = await vscode.window.showOpenDialog({
-    canSelectMany: false,
-    filters: { 'JSON Files': ['json'] },
-    openLabel: 'Select API Graph JSON',
-  });
-
-  if (uris && uris.length > 0) {
-    lastJsonPath = uris[0].fsPath;
-    await loadAndShowGraph(context, lastJsonPath);
-  }
+  return folders[0].uri.fsPath;
 }
 
 function getGitRepoRootForPath(fsPath: string | undefined): string | undefined {
@@ -479,42 +311,18 @@ function attachGitHeat(graphData: GraphData, cwd: string | undefined): void {
   }
 }
 
-async function loadAndShowGraph(
-  context: vscode.ExtensionContext,
-  jsonPath: string
-): Promise<void> {
-  try {
-    const raw = fs.readFileSync(jsonPath, 'utf-8');
-    const data: ApiJsonData = JSON.parse(raw);
-    let graphData: GraphData = buildGraphSnapshots(data);
-    attachGitHeat(graphData, getGitRepoRootForPath(jsonPath));
-
-    if (graphData.routeNames.length === 0) {
-      vscode.window.showWarningMessage('No API routes found in the selected JSON file.');
-      return;
-    }
-
-    lastApiGraphMeta = { routeNames: graphData.routeNames, nodeIds: [] };
-    GraphPanel.createOrShow(context.extensionUri, graphData, (traceState) => {
-      traceSidebarProvider.updateTraceState(traceState);
-    }, (routeNames, nodeIds, currentRouteId) => {
-      lastApiGraphMeta = { routeNames: routeNames || [], nodeIds: nodeIds || [] };
-      traceSidebarProvider.updateGraphMeta(routeNames, nodeIds, 'api', currentRouteId);
-      const imports = (routeNames || []).filter((r): r is string => typeof r === 'string' && r.startsWith('Import:'));
-      fileDropProvider.updateDroppedFiles(imports);
-    }, (msg) => {
-      if ((msg.type as string) === 'cmd:openFile') {
-        openFileInEditor(msg.filePath as string);
-      } else {
-        traceSidebarProvider.forwardToSidebar(msg);
-      }
-    });
-
-    traceSidebarProvider.updateGenerateButtonState(true);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    vscode.window.showErrorMessage(`Failed to load API graph: ${message}`);
+async function openVisualizer(context: vscode.ExtensionContext): Promise<void> {
+  if (lastJsonPath && fs.existsSync(lastJsonPath)) {
+    await loadAndShowFileGraph(context, lastJsonPath);
+    return;
   }
+  const detected = findLatestFileGraphJson();
+  if (detected) {
+    lastJsonPath = detected;
+    await loadAndShowFileGraph(context, detected);
+    return;
+  }
+  vscode.window.showInformationMessage('No file graph found. Use "Build From File" to create one.');
 }
 
 async function pickFileAndBuildGraph(
@@ -638,7 +446,6 @@ async function buildGraphFromFile(
 
     fileDropProvider.updateDroppedFiles([`Import: ${relPath}`]);
     await loadAndShowFileGraph(context, outPath);
-    traceSidebarProvider.updateGenerateButtonState(true);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`Failed to build import graph: ${message}`);
@@ -672,73 +479,190 @@ function runFileGraphScriptInTerminal(
   terminal.sendText(`npx ts-node "${scriptPath}" "${absPath}" --llm --out "${outputPath}"`);
 }
 
-function findJsonInWorkspace(): string | undefined {
+function findLatestFileGraphJson(): string | undefined {
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders) return undefined;
-
+  let latest: { path: string; mtime: number } | null = null;
   for (const folder of workspaceFolders) {
-    const inVisualizer = path.join(folder.uri.fsPath, 'visualizer', 'api_graph_output.json');
-    if (fs.existsSync(inVisualizer)) return inVisualizer;
-    const inRoot = path.join(folder.uri.fsPath, 'api_graph_output.json');
-    if (fs.existsSync(inRoot)) return inRoot;
+    const root = folder.uri.fsPath;
+    const fileGraph = path.join(root, 'visualizer', 'file_graph_output.json');
+    if (fs.existsSync(fileGraph)) {
+      const mtime = fs.statSync(fileGraph).mtimeMs;
+      if (!latest || mtime > latest.mtime) latest = { path: fileGraph, mtime };
+    }
+    const filesNamedDir = path.join(root, 'visualizer', 'files_named');
+    if (fs.existsSync(filesNamedDir) && fs.statSync(filesNamedDir).isDirectory()) {
+      for (const name of fs.readdirSync(filesNamedDir)) {
+        if (!name.endsWith('.json')) continue;
+        const fp = path.join(filesNamedDir, name);
+        if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) continue;
+        const mtime = fs.statSync(fp).mtimeMs;
+        if (!latest || mtime > latest.mtime) latest = { path: fp, mtime };
+      }
+    }
   }
-  return undefined;
+  return latest?.path;
 }
 
-function autoDetectJsonFile(context: vscode.ExtensionContext): void {
-  const watcher = vscode.workspace.createFileSystemWatcher('**/api_graph_output.json');
-
-  watcher.onDidCreate((uri) => {
-    lastJsonPath = uri.fsPath;
-    traceSidebarProvider.updateGenerateButtonState(true);
-    void loadAndShowGraph(context, uri.fsPath);
-  });
-
-  watcher.onDidChange((uri) => {
-    if (lastJsonPath === uri.fsPath && GraphPanel.currentPanel) {
-      void loadAndShowGraph(context, uri.fsPath);
-    }
-  });
-
-  context.subscriptions.push(watcher);
-
+function autoDetectFileGraphs(context: vscode.ExtensionContext): void {
   const fileGraphWatcher = vscode.workspace.createFileSystemWatcher('**/file_graph_output.json');
   const filesNamedWatcher = vscode.workspace.createFileSystemWatcher('**/visualizer/files_named/*.json');
 
   const loadFileGraphFromUri = (uri: vscode.Uri) => {
     lastJsonPath = uri.fsPath;
-    loadAndShowFileGraph(context, uri.fsPath);
-    traceSidebarProvider.updateGenerateButtonState(true);
+    void loadAndShowFileGraph(context, uri.fsPath, 'refreshOpenOrOpen');
   };
 
   fileGraphWatcher.onDidCreate(loadFileGraphFromUri);
-  fileGraphWatcher.onDidChange((uri) => loadAndShowFileGraph(context, uri.fsPath));
+  fileGraphWatcher.onDidChange((uri) => {
+    void loadAndShowFileGraph(context, uri.fsPath, 'refreshOpenOrOpen');
+  });
 
   filesNamedWatcher.onDidCreate((uri) => {
     loadFileGraphFromUri(uri);
     fileDropProvider.refreshFromFilesNamed();
   });
   filesNamedWatcher.onDidChange((uri) => {
-    loadAndShowFileGraph(context, uri.fsPath);
+    void loadAndShowFileGraph(context, uri.fsPath, 'refreshOpenOrOpen');
     fileDropProvider.refreshFromFilesNamed();
   });
   filesNamedWatcher.onDidDelete(() => fileDropProvider.refreshFromFilesNamed());
 
   context.subscriptions.push(fileGraphWatcher, filesNamedWatcher);
+}
 
-  const detected = findJsonInWorkspace();
-  if (detected) {
-    lastJsonPath = detected;
+function graphPanelHooks() {
+  return {
+    onBacktrack: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => {
+      void runBacktrackFromWebview(payload.nodeId, payload.routeId, payload.sourceJsonPath);
+    },
+    onSaveBacktrack: (sourceJsonPath: string) => {
+      void saveBacktrackGraph(sourceJsonPath);
+    },
+    onSaveBacktrackPrompt: (sourceJsonPath: string) => {
+      void promptSaveBacktrack(sourceJsonPath);
+    },
+  };
+}
+
+async function runBacktrackFromWebview(
+  nodeId: string,
+  routeId: string,
+  sourceJsonPath: string
+): Promise<void> {
+  const root = getPreferredProjectRoot(sourceJsonPath);
+  if (!root) {
+    vscode.window.showErrorMessage('No workspace root for backtrack.');
+    return;
   }
+  let graphData = graphDataByJsonPath.get(sourceJsonPath);
+  if (!graphData) {
+    try {
+      const raw = fs.readFileSync(sourceJsonPath, 'utf-8');
+      graphData = JSON.parse(raw) as GraphData;
+    } catch {
+      vscode.window.showErrorMessage('Could not load graph data for this session.');
+      return;
+    }
+  }
+
+  const routeKey =
+    routeId && graphData.graphSnapshots[routeId]
+      ? routeId
+      : graphData.routeNames.find((r) => graphData.graphSnapshots[r]) ?? graphData.routeNames[0];
+  if (!routeKey || !graphData.graphSnapshots[routeKey]) {
+    vscode.window.showErrorMessage('No graph route available for backtrack.');
+    return;
+  }
+
+  const { closureRelPaths, edges } = computeImporterClosureFromOpenEditors(nodeId, root);
+  if (closureRelPaths.length <= 1) {
+    vscode.window.showInformationMessage(
+      'No open files import this node yet. Open files that import it, then run Backtrack again.'
+    );
+    return;
+  }
+
+  const { newNodesAdded } = mergeBacktrackIntoRoute(graphData, routeKey, closureRelPaths, edges);
+  if (newNodesAdded <= 0) {
+    vscode.window.showInformationMessage(
+      'Backtrack: every file in the closure is already in this graph — nothing new to add.'
+    );
+    return;
+  }
+
+  graphData.backtrack = {
+    seedNodeRelPath: nodeId,
+    closureRelPaths,
+    generatedAt: Date.now(),
+  };
+  attachGitHeat(graphData, getGitRepoRootForPath(sourceJsonPath));
+  graphDataByJsonPath.set(sourceJsonPath, graphData);
+
+  const displayLabel = `backtracked · ${path.basename(sourceJsonPath)}`;
+  const msg: UpsertSessionMessage = {
+    type: 'upsertSession',
+    sourceJsonPath,
+    graphSnapshots: graphData.graphSnapshots,
+    routeNames: graphData.routeNames,
+    initialRouteId: routeKey,
+    sessionMode: 'replace',
+    isBacktrackSession: true,
+    backtrackDirty: true,
+    displayLabel,
+  };
+  GraphPanel.instance?.deliverUpsertExternal(msg);
+
+  vscode.window.showInformationMessage(
+    `Backtrack: added ${newNodesAdded} new file node(s). Save with Ctrl+S or the tab.`
+  );
+}
+
+async function saveBacktrackGraph(sourceJsonPath: string): Promise<void> {
+  const graphData = graphDataByJsonPath.get(sourceJsonPath);
+  if (!graphData?.backtrack) {
+    vscode.window.showWarningMessage('Nothing to save — run Backtrack first.');
+    return;
+  }
+  const root = getPreferredProjectRoot(sourceJsonPath);
+  if (!root) {
+    vscode.window.showErrorMessage('No workspace folder.');
+    return;
+  }
+  const outDir = path.join(root, 'visualizer', 'backtracked');
+  fs.mkdirSync(outDir, { recursive: true });
+  const base = path.basename(sourceJsonPath);
+  const name = base.toLowerCase().startsWith('backtracked_') ? base : `backtracked_${base}`;
+  const outPath = path.join(outDir, name);
+  try {
+    fs.writeFileSync(outPath, JSON.stringify(graphData, null, 2), 'utf-8');
+    vscode.window.showInformationMessage(`Saved: ${path.relative(root, outPath)}`);
+    graphDataByJsonPath.set(sourceJsonPath, graphData);
+    GraphPanel.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false });
+    fileDropProvider.refreshSavedGraphs();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Save failed: ${msg}`);
+  }
+}
+
+async function promptSaveBacktrack(sourceJsonPath: string): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(
+    'Save backtracked graph JSON to visualizer/backtracked?',
+    'Save',
+    'Cancel'
+  );
+  if (choice === 'Save') await saveBacktrackGraph(sourceJsonPath);
 }
 
 async function loadAndShowFileGraph(
   context: vscode.ExtensionContext,
-  jsonPath: string
+  jsonPath: string,
+  mode: GraphPanelLoadMode = 'newWindow'
 ): Promise<void> {
   try {
     const raw = fs.readFileSync(jsonPath, 'utf-8');
-    let graphData: GraphData = JSON.parse(raw);
+    const graphData: GraphData = JSON.parse(raw);
 
     if (graphData.routeNames.length === 0) {
       vscode.window.showWarningMessage('No routes found in file graph output.');
@@ -748,47 +672,37 @@ async function loadAndShowFileGraph(
     const fileRoute = graphData.routeNames.find((r) => r.startsWith('Import:')) ?? graphData.routeNames[0];
     const fileRelPath = fileRoute.replace(/^Import:\s*/, '');
     const skipRestore = fileDropProvider.hasSoftDeleted(fileRelPath);
-    const apiJsonPath = findJsonInWorkspace();
-    if (apiJsonPath && apiJsonPath !== jsonPath) {
-      try {
-        const apiRaw = fs.readFileSync(apiJsonPath, 'utf-8');
-        const apiData: ApiJsonData = JSON.parse(apiRaw);
-        const apiGraphData = buildGraphSnapshots(apiData);
-        if (apiGraphData.routeNames.length > 0) {
-          graphData = {
-            graphSnapshots: { ...apiGraphData.graphSnapshots, ...graphData.graphSnapshots },
-            routeNames: [...apiGraphData.routeNames, ...graphData.routeNames.filter((r) => !apiGraphData.routeNames.includes(r))],
-          };
-          lastApiGraphMeta = { routeNames: apiGraphData.routeNames, nodeIds: [] };
-        }
-      } catch {
-        /* ignore */
-      }
-    }
 
     lastJsonPath = jsonPath;
+    graphDataByJsonPath.set(jsonPath, graphData);
     attachGitHeat(graphData, getGitRepoRootForPath(jsonPath));
 
-    GraphPanel.createOrShow(context.extensionUri, graphData, (traceState) => {
-      traceSidebarProvider.updateTraceState(traceState);
-    }, (routeNames, nodeIds) => {
-      const apiRoutes = lastApiGraphMeta?.routeNames ?? [];
-      const fileRoutes = (routeNames || []).filter((r): r is string => typeof r === 'string' && r.startsWith('Import:'));
-      const apiNodeIds = lastApiGraphMeta?.nodeIds ?? [];
-      const fileNodeIds = nodeIds || [];
-      const mergedRoutes = [...apiRoutes, ...fileRoutes.filter((r) => !apiRoutes.includes(r))];
-      const mergedNodeIds = [...new Set([...apiNodeIds, ...fileNodeIds])];
-      traceSidebarProvider.updateGraphMeta(mergedRoutes, mergedNodeIds, 'file');
-      if (!skipRestore) fileDropProvider.updateDroppedFiles(fileRoutes);
-    }, (msg) => {
-      if ((msg.type as string) === 'cmd:openFile') {
-        openFileInEditor(msg.filePath as string);
-      } else {
-        traceSidebarProvider.forwardToSidebar(msg);
-      }
-    }, fileRoute);
+    const hooks = {
+      ...graphPanelHooks(),
+      ...(graphData.backtrack
+        ? {
+            initialSession: {
+              isBacktrackSession: true as const,
+              backtrackDirty: false as const,
+              displayLabel: `backtracked · ${path.basename(jsonPath)}`,
+            },
+          }
+        : {}),
+    };
 
-    traceSidebarProvider.updateGenerateButtonState(true);
+    GraphPanel.open(
+      context.extensionUri,
+      graphData,
+      (routeNames) => {
+        const fileRoutes = (routeNames || []).filter((r): r is string => typeof r === 'string' && r.startsWith('Import:'));
+        if (!skipRestore) fileDropProvider.updateDroppedFiles(fileRoutes);
+      },
+      (filePath) => openFileInEditor(filePath),
+      fileRoute,
+      jsonPath,
+      mode,
+      hooks
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`Failed to load file graph: ${message}`);

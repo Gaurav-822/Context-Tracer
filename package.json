@@ -1,7 +1,7 @@
 {
   "name": "api-graph-visualizer",
-  "displayName": "API Graph Visualizer",
-  "description": "Interactive visualization of API route dependency graphs",
+  "displayName": "File Graph Visualizer",
+  "description": "Interactive visualization of file dependency graphs",
   "version": "0.1.0",
   "publisher": "gauravbhushan",
   "engines": {
@@ -18,16 +18,12 @@
     "commands": [
       {
         "command": "apiGraphVisualizer.open",
-        "title": "API Graph: Open Visualizer",
+        "title": "File Graph: Open Visualizer",
         "icon": "$(type-hierarchy)"
       },
       {
-        "command": "apiGraphVisualizer.selectFile",
-        "title": "API Graph: Select JSON File"
-      },
-      {
         "command": "apiGraphVisualizer.focusInGraph",
-        "title": "Focus in API Graph",
+        "title": "Focus in File Graph",
         "icon": "$(search-focus)"
       },
       {
@@ -37,20 +33,20 @@
       },
       {
         "command": "apiGraphVisualizer.buildFromResource",
-        "title": "API Graph: Build Import Graph",
+        "title": "File Graph: Build Import Graph",
         "icon": "$(graph)"
       },
       {
         "command": "apiGraphVisualizer.pickFileForGraph",
-        "title": "API Graph: Browse File"
+        "title": "File Graph: Browse File"
       },
       {
         "command": "apiGraphVisualizer.loadImportRoute",
-        "title": "API Graph: Load Import"
+        "title": "File Graph: Load Import"
       },
       {
         "command": "apiGraphVisualizer.toggleFileGraphLlm",
-        "title": "API Graph: Toggle LLM"
+        "title": "File Graph: Toggle LLM"
       },
       {
         "command": "apiGraphVisualizer.softDeleteFromBuildFromFile",
@@ -63,6 +59,11 @@
       {
         "command": "apiGraphVisualizer.restoreFromBuildFromFile",
         "title": "Restore"
+      },
+      {
+        "command": "apiGraphVisualizer.openBacktrackedGraphsFolder",
+        "title": "File Graph: Open backtracked graphs folder",
+        "icon": "$(folder-opened)"
       }
     ],
     "keybindings": [
@@ -84,12 +85,12 @@
       "view/item/context": [
         {
           "command": "apiGraphVisualizer.softDeleteFromBuildFromFile",
-          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == fileItem",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == workspaceFile",
           "group": "1_modification"
         },
         {
           "command": "apiGraphVisualizer.hardDeleteFromBuildFromFile",
-          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == fileItem",
+          "when": "view == apiGraphVisualizer.fileDropTree && viewItem == workspaceFile",
           "group": "1_modification"
         },
         {
@@ -114,13 +115,20 @@
           "when": "editorTextFocus",
           "group": "2_editor"
         }
+      ],
+      "view/title": [
+        {
+          "command": "apiGraphVisualizer.openBacktrackedGraphsFolder",
+          "when": "view == apiGraphVisualizer.fileDropTree",
+          "group": "navigation"
+        }
       ]
     },
     "viewsContainers": {
       "activitybar": [
         {
           "id": "api-graph-sidebar",
-          "title": "API Graph",
+          "title": "Import graph",
           "icon": "media/icon.svg"
         }
       ]
@@ -131,11 +139,6 @@
           "type": "tree",
           "id": "apiGraphVisualizer.fileDropTree",
           "name": "Build From File"
-        },
-        {
-          "type": "webview",
-          "id": "apiGraphVisualizer.traceView",
-          "name": "Trace Graph"
         }
       ]
     }

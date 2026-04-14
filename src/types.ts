@@ -42,9 +42,18 @@ export interface GraphSnapshot {
   controllerId: string | null;
 }
 
+/** Written into saved JSON after Backtrack; UI state does not rely on filename. */
+export interface GraphDataBacktrackMeta {
+  seedNodeRelPath: string;
+  closureRelPaths: string[];
+  generatedAt: number;
+}
+
 export interface GraphData {
   graphSnapshots: Record<string, GraphSnapshot>;
   routeNames: string[];
+  gitHeatByPath?: Record<string, number>;
+  backtrack?: GraphDataBacktrackMeta;
 }
 
 export interface TraceState {

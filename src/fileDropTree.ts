@@ -5,9 +5,27 @@ import * as vscode from 'vscode';
 const VALID_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
 const SOFT_DELETED_KEY = 'apiGraphVisualizer.softDeleted';
 
+const SECTION_FEATURES = 'section:features';
+const SECTION_SAVED = 'section:saved';
+const SECTION_FILES = 'section:files';
+const ARCHIVED_ID = 'archived-section';
+
+/** id: wsfile/<wsIndex>/<posixRelPath> */
+const WS_FILE_PREFIX = 'wsfile/';
+const WS_DIR_PREFIX = 'wsdir/';
+const WS_ROOT_PREFIX = 'wsroot/';
+
 function isValidFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
   return VALID_EXTS.includes(ext);
+}
+
+function toPosix(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+function shouldSkipDirName(name: string): boolean {
+  return name === 'node_modules' || name === '.git' || name === '.svn' || name === '.hg';
 }
 
 /** Convert relative path to safe filename for visualizer/files_named/ */
@@ -40,6 +58,37 @@ export function scanFilesNamed(projectRoot: string): string[] {
     /* ignore */
   }
   return paths;
+}
+
+/** Scan visualizer/backtracked and return saved graph JSON absolute paths. */
+export function scanSavedBacktrackedJson(projectRoot: string): string[] {
+  const dir = path.join(projectRoot, 'visualizer', 'backtracked');
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return [];
+  const files: string[] = [];
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith('.json')) continue;
+      const fp = path.join(dir, name);
+      if (!fs.statSync(fp).isFile()) continue;
+      files.push(fp);
+    }
+  } catch {
+    /* ignore */
+  }
+  files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return files;
+}
+
+/**
+ * Parse workspace file tree id → posix rel path (from workspace folder root).
+ * Returns undefined if not a workspace file id.
+ */
+export function relPathFromWorkspaceTreeId(id: string | undefined): string | undefined {
+  if (!id || !id.startsWith(WS_FILE_PREFIX)) return undefined;
+  const rest = id.slice(WS_FILE_PREFIX.length);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return undefined;
+  return rest.slice(slash + 1);
 }
 
 export class FileDropTreeProvider
@@ -84,6 +133,11 @@ export class FileDropTreeProvider
     const active = fromDisk.filter((p) => !this.softDeleted.has(p));
     const merged = new Set([...this.droppedFiles, ...active]);
     this.droppedFiles = [...merged];
+    this._onDidChangeTreeData.fire();
+  }
+
+  /** Refresh tree sections that depend on saved graph files. */
+  refreshSavedGraphs(): void {
     this._onDidChangeTreeData.fire();
   }
 
@@ -156,13 +210,92 @@ export class FileDropTreeProvider
     return element;
   }
 
-  async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
-    const FILES_ID = 'files-section';
-    const ARCHIVED_ID = 'archived-section';
+  private listWorkspaceRoots(): vscode.TreeItem[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) {
+      const empty = new vscode.TreeItem('No folder open', vscode.TreeItemCollapsibleState.None);
+      empty.description = 'Open a workspace folder';
+      return [empty];
+    }
+    if (folders.length === 1) {
+      return this.listDirEntries(0, '');
+    }
+    return folders.map((wf, i) => {
+      const ti = new vscode.TreeItem(wf.name, vscode.TreeItemCollapsibleState.Collapsed);
+      ti.id = `${WS_ROOT_PREFIX}${i}`;
+      ti.resourceUri = wf.uri;
+      ti.iconPath = new vscode.ThemeIcon('folder-opened');
+      ti.tooltip = wf.uri.fsPath;
+      return ti;
+    });
+  }
 
-    if (element?.id === 'add-files-option') {
+  private listDirEntries(wsIndex: number, relPosix: string): vscode.TreeItem[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.[wsIndex]) return [];
+    const rootAbs = folders[wsIndex].uri.fsPath;
+    const dirAbs = relPosix ? path.join(rootAbs, relPosix) : rootAbs;
+    let dirents: fs.Dirent[];
+    try {
+      dirents = fs.readdirSync(dirAbs, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const dirs: { name: string; abs: string }[] = [];
+    const files: { name: string; abs: string }[] = [];
+    for (const d of dirents) {
+      const name = d.name;
+      if (d.isDirectory()) {
+        if (shouldSkipDirName(name)) continue;
+        dirs.push({ name, abs: path.join(dirAbs, name) });
+      } else if (d.isFile() && isValidFile(name)) {
+        files.push({ name, abs: path.join(dirAbs, name) });
+      }
+    }
+    dirs.sort((a, b) => a.name.localeCompare(b.name));
+    files.sort((a, b) => a.name.localeCompare(b.name));
+
+    const items: vscode.TreeItem[] = [];
+    for (const { name, abs } of dirs) {
+      const childRel = relPosix ? `${relPosix}/${name}` : name;
+      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Collapsed);
+      ti.id = `${WS_DIR_PREFIX}${wsIndex}/${childRel}`;
+      ti.resourceUri = vscode.Uri.file(abs);
+      ti.iconPath = new vscode.ThemeIcon('folder');
+      ti.tooltip = toPosix(path.relative(rootAbs, abs));
+      ti.contextValue = 'workspaceFolder';
+      items.push(ti);
+    }
+    for (const { name, abs } of files) {
+      const childRel = relPosix ? `${relPosix}/${name}` : name;
+      const relForId = toPosix(childRel);
+      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.None);
+      ti.id = `${WS_FILE_PREFIX}${wsIndex}/${relForId}`;
+      ti.resourceUri = vscode.Uri.file(abs);
+      ti.description = relForId;
+      ti.iconPath = new vscode.ThemeIcon('file-code');
+      ti.tooltip = `Open import map for ${relForId}`;
+      ti.contextValue = 'workspaceFile';
+      const uri = vscode.Uri.file(abs);
+      ti.command = {
+        command: 'apiGraphVisualizer.buildFromResource',
+        title: 'Open map',
+        arguments: [uri],
+      };
+      items.push(ti);
+    }
+    return items;
+  }
+
+  async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+    if (element?.id === 'feature:llm') {
+      return [];
+    }
+
+    if (element?.id === SECTION_FEATURES) {
       const llmItem = new vscode.TreeItem('Use AI', vscode.TreeItemCollapsibleState.None);
-      llmItem.id = 'llm-option';
+      llmItem.id = 'feature:llm';
       llmItem.description = this.useLlm ? 'ON' : 'OFF';
       llmItem.tooltip = 'Click to toggle LLM summaries for import graphs';
       llmItem.iconPath = new vscode.ThemeIcon(this.useLlm ? 'sparkle' : 'circle-outline');
@@ -171,23 +304,50 @@ export class FileDropTreeProvider
       return [llmItem];
     }
 
-    if (element?.id === 'llm-option') {
-      return [];
-    }
-
-    if (element?.id === FILES_ID) {
-      return this.droppedFiles.map((file) => {
-        const ti = new vscode.TreeItem(file, vscode.TreeItemCollapsibleState.None);
-        ti.iconPath = new vscode.ThemeIcon('file-code');
-        ti.tooltip = `Import: ${file}`;
-        ti.contextValue = 'fileItem';
-        ti.command = { command: 'apiGraphVisualizer.loadImportRoute', title: 'Load', arguments: [undefined, `Import: ${file}`] };
+    if (element?.id === SECTION_SAVED) {
+      const folders = vscode.workspace.workspaceFolders;
+      if (!folders?.length) return [];
+      const root = folders[0].uri.fsPath;
+      const saved = scanSavedBacktrackedJson(root);
+      return saved.map((fp) => {
+        const base = path.basename(fp);
+        const rel = toPosix(path.relative(root, fp));
+        const ti = new vscode.TreeItem(base, vscode.TreeItemCollapsibleState.None);
+        ti.iconPath = new vscode.ThemeIcon('save');
+        ti.description = 'backtracked';
+        ti.tooltip = rel;
+        ti.contextValue = 'savedGraphFile';
+        ti.command = {
+          command: 'apiGraphVisualizer.loadSavedGraph',
+          title: 'Open saved graph',
+          arguments: [vscode.Uri.file(fp)],
+        };
         return ti;
       });
     }
 
+    if (element?.id === SECTION_FILES) {
+      return this.listWorkspaceRoots();
+    }
+
+    if (element?.id?.startsWith(WS_ROOT_PREFIX)) {
+      const idx = parseInt(element.id.slice(WS_ROOT_PREFIX.length), 10);
+      if (Number.isNaN(idx)) return [];
+      return this.listDirEntries(idx, '');
+    }
+
+    if (element?.id?.startsWith(WS_DIR_PREFIX)) {
+      const rest = element.id.slice(WS_DIR_PREFIX.length);
+      const slash = rest.indexOf('/');
+      if (slash < 0) return [];
+      const wsIndex = parseInt(rest.slice(0, slash), 10);
+      if (Number.isNaN(wsIndex)) return [];
+      const relPosix = rest.slice(slash + 1);
+      return this.listDirEntries(wsIndex, relPosix);
+    }
+
     if (element?.id === ARCHIVED_ID) {
-      return [...this.softDeleted].map((file) => {
+      return [...this.softDeleted].sort((a, b) => a.localeCompare(b)).map((file) => {
         const ti = new vscode.TreeItem(file, vscode.TreeItemCollapsibleState.None);
         ti.iconPath = new vscode.ThemeIcon('file-code');
         ti.tooltip = `Archived: ${file}`;
@@ -199,18 +359,29 @@ export class FileDropTreeProvider
 
     const items: vscode.TreeItem[] = [];
 
-    const dropItem = new vscode.TreeItem('Add files', vscode.TreeItemCollapsibleState.Expanded);
-    dropItem.id = 'add-files-option';
-    dropItem.description = 'Drop or browse';
-    dropItem.tooltip = 'Drag .ts/.js files here or click to browse';
-    dropItem.iconPath = new vscode.ThemeIcon('add');
-    dropItem.command = { command: 'apiGraphVisualizer.pickFileForGraph', title: 'Browse' };
+    const featuresSection = new vscode.TreeItem('Features', vscode.TreeItemCollapsibleState.Expanded);
+    featuresSection.id = SECTION_FEATURES;
+    featuresSection.description = 'Options';
+    featuresSection.iconPath = new vscode.ThemeIcon('settings-gear');
+    featuresSection.contextValue = 'sectionHeader';
+    items.push(featuresSection);
 
-    items.push(dropItem);
+    const folders = vscode.workspace.workspaceFolders;
+    const root = folders?.[0]?.uri.fsPath;
+    const savedCount = root ? scanSavedBacktrackedJson(root).length : 0;
+    const savedSection = new vscode.TreeItem(
+      'Saved',
+      savedCount > 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+    );
+    savedSection.id = SECTION_SAVED;
+    savedSection.description = `${savedCount} file${savedCount === 1 ? '' : 's'}`;
+    savedSection.iconPath = new vscode.ThemeIcon('save-all');
+    savedSection.contextValue = 'sectionHeader';
+    items.push(savedSection);
 
     const filesSection = new vscode.TreeItem('Files', vscode.TreeItemCollapsibleState.Expanded);
-    filesSection.id = FILES_ID;
-    filesSection.description = this.droppedFiles.length > 0 ? `${this.droppedFiles.length} file${this.droppedFiles.length === 1 ? '' : 's'}` : 'Empty';
+    filesSection.id = SECTION_FILES;
+    filesSection.description = 'Workspace';
     filesSection.iconPath = new vscode.ThemeIcon('folder');
     filesSection.contextValue = 'sectionHeader';
     items.push(filesSection);

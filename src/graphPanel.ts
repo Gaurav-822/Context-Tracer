@@ -1,45 +1,105 @@
 import * as vscode from 'vscode';
-import { GraphData, TraceState } from './types';
+import { GraphData } from './types';
+
+export type GraphPanelLoadMode = 'newWindow' | 'refreshOpenOrOpen';
+
+/** Sent to webview to add/update a graph session (tabs live inside the single Import graph panel). */
+export interface UpsertSessionMessage {
+  type: 'upsertSession';
+  sourceJsonPath: string;
+  graphSnapshots: GraphData['graphSnapshots'];
+  routeNames: string[];
+  initialRouteId: string | undefined;
+  /** add: new tab (or replace same path). replace: update existing tab for this JSON only. */
+  sessionMode: 'add' | 'replace';
+  /** Explicit session flags (do not infer from filename). */
+  isBacktrackSession?: boolean;
+  backtrackDirty?: boolean;
+  /** Optional tab label (e.g. "backtracked · file.json"). */
+  displayLabel?: string;
+}
+
+export interface SessionStateMessage {
+  type: 'sessionState';
+  sourceJsonPath: string;
+  isBacktrackSession?: boolean;
+  backtrackDirty?: boolean;
+  displayLabel?: string;
+}
 
 export class GraphPanel {
-  public static currentPanel: GraphPanel | undefined;
   private static readonly viewType = 'apiGraphVisualizer.graphView';
+  /** Single Import graph editor tab; multiple graphs are tabs inside its webview. */
+  static instance: GraphPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly extensionUri: vscode.Uri;
   private disposables: vscode.Disposable[] = [];
-  private graphData: GraphData | null = null;
-  private initialRouteId: string | undefined = undefined;
-  private onTraceUpdate: ((state: TraceState) => void) | null = null;
   private onGraphMetaReady: ((routeNames: string[], nodeIds: string[], currentRouteId?: string) => void) | null = null;
-  private onForwardToSidebar: ((msg: Record<string, unknown>) => void) | null = null;
+  private onOpenFileFromGraph: ((filePath: string) => void) | null = null;
+  private onBacktrack:
+    | ((payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void)
+    | null = null;
+  private onSaveBacktrack: ((sourceJsonPath: string) => void) | null = null;
+  private onSaveBacktrackPrompt: ((sourceJsonPath: string) => void) | null = null;
+  private pendingUpsert: UpsertSessionMessage | null = null;
 
-  public static createOrShow(
+  public static open(
     extensionUri: vscode.Uri,
     graphData: GraphData,
-    onTraceUpdate: (state: TraceState) => void,
     onGraphMetaReady: (routeNames: string[], nodeIds: string[], currentRouteId?: string) => void,
-    onForwardToSidebar: (msg: Record<string, unknown>) => void,
-    initialRouteId?: string
+    onOpenFileFromGraph: (filePath: string) => void,
+    initialRouteId: string | undefined,
+    sourceJsonPath: string,
+    mode: GraphPanelLoadMode,
+    hooks?: {
+      onBacktrack?: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void;
+      onSaveBacktrack?: (sourceJsonPath: string) => void;
+      onSaveBacktrackPrompt?: (sourceJsonPath: string) => void;
+      /** When loading JSON that was saved after backtrack, restore tab styling without inferring from filename. */
+      initialSession?: {
+        isBacktrackSession?: boolean;
+        backtrackDirty?: boolean;
+        displayLabel?: string;
+      };
+    }
   ): GraphPanel {
+    const sessionMode: 'add' | 'replace' =
+      mode === 'refreshOpenOrOpen' ? 'replace' : 'add';
+
+    const ini = hooks?.initialSession;
+    const msg: UpsertSessionMessage = {
+      type: 'upsertSession',
+      sourceJsonPath,
+      graphSnapshots: graphData.graphSnapshots,
+      routeNames: graphData.routeNames,
+      initialRouteId,
+      sessionMode,
+      isBacktrackSession: ini?.isBacktrackSession ?? false,
+      backtrackDirty: ini?.backtrackDirty ?? false,
+    };
+    if (ini?.displayLabel !== undefined) {
+      msg.displayLabel = ini.displayLabel;
+    }
+
+    if (GraphPanel.instance) {
+      GraphPanel.instance.onGraphMetaReady = onGraphMetaReady;
+      GraphPanel.instance.onOpenFileFromGraph = onOpenFileFromGraph;
+      GraphPanel.instance.onBacktrack = hooks?.onBacktrack ?? null;
+      GraphPanel.instance.onSaveBacktrack = hooks?.onSaveBacktrack ?? null;
+      GraphPanel.instance.onSaveBacktrackPrompt = hooks?.onSaveBacktrackPrompt ?? null;
+      GraphPanel.instance.deliverUpsert(msg);
+      GraphPanel.instance.reveal();
+      return GraphPanel.instance;
+    }
+
     const column = vscode.window.activeTextEditor
       ? vscode.window.activeTextEditor.viewColumn
       : undefined;
 
-    if (GraphPanel.currentPanel) {
-      GraphPanel.currentPanel.panel.reveal(column);
-      GraphPanel.currentPanel.graphData = graphData;
-      GraphPanel.currentPanel.initialRouteId = initialRouteId;
-      GraphPanel.currentPanel.onTraceUpdate = onTraceUpdate;
-      GraphPanel.currentPanel.onGraphMetaReady = onGraphMetaReady;
-      GraphPanel.currentPanel.onForwardToSidebar = onForwardToSidebar;
-      GraphPanel.currentPanel.sendGraphData();
-      return GraphPanel.currentPanel;
-    }
-
-    const panel = vscode.window.createWebviewPanel(
+    const webviewPanel = vscode.window.createWebviewPanel(
       GraphPanel.viewType,
-      'API Graph',
+      'Import graph',
       column || vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -47,33 +107,43 @@ export class GraphPanel {
         localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
       }
     );
-    panel.iconPath = {
+    webviewPanel.iconPath = {
       light: vscode.Uri.joinPath(extensionUri, 'media', 'icon-light.svg'),
       dark: vscode.Uri.joinPath(extensionUri, 'media', 'icon-dark.svg'),
     };
 
-    GraphPanel.currentPanel = new GraphPanel(
-      panel, extensionUri, graphData, onTraceUpdate, onGraphMetaReady, onForwardToSidebar, initialRouteId
+    GraphPanel.instance = new GraphPanel(
+      webviewPanel,
+      extensionUri,
+      onGraphMetaReady,
+      onOpenFileFromGraph,
+      hooks?.onBacktrack ?? null,
+      hooks?.onSaveBacktrack ?? null,
+      hooks?.onSaveBacktrackPrompt ?? null,
+      msg
     );
-    return GraphPanel.currentPanel;
+    GraphPanel.instance.reveal();
+    return GraphPanel.instance;
   }
 
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
-    graphData: GraphData,
-    onTraceUpdate: (state: TraceState) => void,
     onGraphMetaReady: (routeNames: string[], nodeIds: string[], currentRouteId?: string) => void,
-    onForwardToSidebar: (msg: Record<string, unknown>) => void,
-    initialRouteId?: string
+    onOpenFileFromGraph: (filePath: string) => void,
+    onBacktrack: GraphPanel['onBacktrack'],
+    onSaveBacktrack: GraphPanel['onSaveBacktrack'],
+    onSaveBacktrackPrompt: GraphPanel['onSaveBacktrackPrompt'],
+    firstUpsert: UpsertSessionMessage
   ) {
     this.panel = panel;
     this.extensionUri = extensionUri;
-    this.graphData = graphData;
-    this.initialRouteId = initialRouteId;
-    this.onTraceUpdate = onTraceUpdate;
     this.onGraphMetaReady = onGraphMetaReady;
-    this.onForwardToSidebar = onForwardToSidebar;
+    this.onOpenFileFromGraph = onOpenFileFromGraph;
+    this.onBacktrack = onBacktrack;
+    this.onSaveBacktrack = onSaveBacktrack;
+    this.onSaveBacktrackPrompt = onSaveBacktrackPrompt;
+    this.pendingUpsert = firstUpsert;
 
     this.panel.webview.html = this.getHtmlForWebview();
 
@@ -83,15 +153,9 @@ export class GraphPanel {
       (message) => {
         switch (message.type) {
           case 'ready':
-            this.sendGraphData();
-            break;
-          case 'traceUpdated':
-            if (this.onTraceUpdate) {
-              this.onTraceUpdate({
-                tracedNodes: message.tracedNodes,
-                tracedEdges: message.tracedEdges,
-                nodeData: message.nodeData,
-              });
+            if (this.pendingUpsert) {
+              this.deliverUpsert(this.pendingUpsert);
+              this.pendingUpsert = null;
             }
             break;
           case 'graphMetaReady':
@@ -99,16 +163,37 @@ export class GraphPanel {
               this.onGraphMetaReady(message.routeNames, message.nodeIds, message.currentRouteId);
             }
             break;
-          case 'nodeSelected':
-          case 'nodeDeselected':
           case 'cmd:openFile':
-            if (this.onForwardToSidebar) {
-              this.onForwardToSidebar(message);
+            if (this.onOpenFileFromGraph && message.filePath) {
+              this.onOpenFileFromGraph(message.filePath as string);
+            }
+            break;
+          case 'cmd:backtrack':
+            if (
+              this.onBacktrack &&
+              typeof message.nodeId === 'string' &&
+              typeof message.sourceJsonPath === 'string'
+            ) {
+              this.onBacktrack({
+                nodeId: message.nodeId,
+                routeId: typeof message.routeId === 'string' ? message.routeId : '',
+                sourceJsonPath: message.sourceJsonPath,
+              });
+            }
+            break;
+          case 'cmd:saveBacktrack':
+            if (this.onSaveBacktrack && typeof message.sourceJsonPath === 'string') {
+              this.onSaveBacktrack(message.sourceJsonPath);
+            }
+            break;
+          case 'cmd:saveBacktrackPrompt':
+            if (this.onSaveBacktrackPrompt && typeof message.sourceJsonPath === 'string') {
+              this.onSaveBacktrackPrompt(message.sourceJsonPath);
             }
             break;
           case 'focusNodeNotFound':
             vscode.window.showInformationMessage(
-              `"${message.filePath}" is not in the current API graph. Generate or update the graph to include it.`
+              `"${message.filePath}" is not in the current import graph. Rebuild the graph from that file if needed.`
             );
             break;
         }
@@ -118,12 +203,12 @@ export class GraphPanel {
     );
   }
 
-  public reveal(): void {
-    this.panel.reveal();
+  private deliverUpsert(msg: UpsertSessionMessage): void {
+    this.panel.webview.postMessage(msg);
   }
 
-  public handleSidebarCommand(msg: Record<string, unknown>): void {
-    this.panel.webview.postMessage(msg);
+  public reveal(): void {
+    this.panel.reveal();
   }
 
   public focusNodeInGraph(filePath: string, silent = false): void {
@@ -134,22 +219,14 @@ export class GraphPanel {
     this.panel.webview.postMessage({ type: 'cmd:requestGraphMeta' });
   }
 
-  public showTraceModal(): void {
-    this.panel.webview.postMessage({ type: 'showTraceModal' });
+  /** Update tab dirty / backtrack flags without replacing graph data. */
+  public postSessionState(msg: Omit<SessionStateMessage, 'type'>): void {
+    this.panel.webview.postMessage({ type: 'sessionState', ...msg });
   }
 
-  private sendGraphData(): void {
-    if (this.graphData) {
-      const msg: Record<string, unknown> = {
-        type: 'loadGraphData',
-        graphSnapshots: this.graphData.graphSnapshots,
-        routeNames: this.graphData.routeNames,
-      };
-      if (this.initialRouteId && this.graphData.graphSnapshots[this.initialRouteId]) {
-        msg.initialRouteId = this.initialRouteId;
-      }
-      this.panel.webview.postMessage(msg);
-    }
+  /** Push a full session update (e.g. after backtrack merge). */
+  public deliverUpsertExternal(msg: UpsertSessionMessage): void {
+    this.deliverUpsert(msg);
   }
 
   private getHtmlForWebview(): string {
@@ -168,28 +245,23 @@ export class GraphPanel {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data:;">
   <link rel="stylesheet" href="${mainCssUri}">
-  <title>API Graph Visualizer</title>
+  <title>Import graph</title>
 </head>
 <body>
   <div id="graph-loading-overlay" class="visible">
     <div class="spinner"></div>
-    <span>Loading graph…</span>
+    <span>Loading file graph…</span>
   </div>
 
-  <div id="mynetwork"></div>
-
-  <div id="controller-methods" style="display:none;">
-    <div id="controller-methods-title"></div>
-    <div id="controller-methods-list"></div>
-    <button id="controller-methods-reset" style="display:none;">Reset to default</button>
+  <div id="graph-app">
+    <div id="graph-tab-bar" class="graph-tab-bar" role="tablist" aria-label="Open import graphs"></div>
+    <div id="mynetwork" class="graph-canvas-wrap"></div>
   </div>
 
   <div id="legend">
-    <div class="item"><div class="dot" style="background:#43A047;"></div> API Route (entry)</div>
-    <div class="item"><div class="dot" style="background:#7B1FA2;"></div> Controller</div>
+    <div class="item"><div class="dot" style="background:#7B1FA2;"></div> Entry file</div>
     <div class="item"><div class="dot" style="background:#1E88E5;"></div> File dependency</div>
     <div class="item"><div class="dot" style="background:#E53935;"></div> Circular dependency</div>
-    <div class="item"><div class="dot" style="background:#FFC107;"></div> Traced path</div>
   </div>
 
   <div id="stats">
@@ -198,14 +270,12 @@ export class GraphPanel {
 
   <button id="centerBtn" title="Center graph">⊙ Center</button>
 
-  <div id="trace-expand-modal">
-    <div id="trace-expand-content">
-      <div id="trace-expand-header">
-        <h4>Traced Path Graph</h4>
-        <button id="trace-expand-close">Close</button>
-      </div>
-      <div id="trace-expand-graph"></div>
-    </div>
+  <div id="nodeInfoPopover" class="node-info-popover" style="display: none;" role="dialog" aria-label="Node details">
+    <button type="button" id="nodeInfoClose" class="node-info-close" aria-label="Close">&times;</button>
+    <div id="nodeInfoTitle" class="node-info-heading"></div>
+    <div id="nodeInfoPath" class="node-info-path"></div>
+    <div id="nodeInfoBody" class="node-info-body"></div>
+    <button type="button" id="nodeInfoBacktrack" class="node-info-backtrack">Backtrack</button>
   </div>
 
   <script nonce="${nonce}" src="${visNetworkUri}"></script>
@@ -215,7 +285,7 @@ export class GraphPanel {
   }
 
   private dispose(): void {
-    GraphPanel.currentPanel = undefined;
+    GraphPanel.instance = undefined;
     this.panel.dispose();
     while (this.disposables.length) {
       const d = this.disposables.pop();
