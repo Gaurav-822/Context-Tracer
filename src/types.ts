@@ -17,6 +17,8 @@ export interface NodeData {
   borderWidthSelected: number;
   margin?: number;
   isController?: boolean;
+  /** BFS depth from entry file (0 = entry). Used for layered reveal in the webview. */
+  importLevel?: number;
 }
 
 export interface EdgeData {

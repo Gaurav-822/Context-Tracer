@@ -182,6 +182,84 @@ function mergeRequireUsed(content: string, result: Set<string>, filter: (s: stri
   }
 }
 
+/** Include relative, absolute, and path-alias specifiers; exclude bare npm like `react` or `@scope/pkg`. */
+function shouldIncludeSpecifierForGraph(spec: string): boolean {
+  if (!spec) return false;
+  if (spec.startsWith('.') || spec.startsWith('/')) return true;
+  if (spec.startsWith('@/') || spec.startsWith('~/')) return true;
+  if (spec.startsWith('@')) {
+    const parts = spec.split('/');
+    if (parts.length === 2 && parts[0].length > 1) return false;
+  }
+  if (!spec.includes('/')) return false;
+  return true;
+}
+
+/**
+ * All local file import specifiers for dependency graphs: static imports, dynamic import(),
+ * require('./x'), export-from, and side-effect imports. Not "used-only" — matches typical bundler graph.
+ */
+export function getAllLocalImportSpecsForGraph(filePath: string): Set<string> {
+  const specs = new Set<string>();
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const scriptKind = getScriptKind(filePath);
+    const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true, scriptKind);
+
+    function addSpec(spec: string | undefined): void {
+      if (spec && shouldIncludeSpecifierForGraph(spec)) specs.add(spec);
+    }
+
+    function visit(node: ts.Node): void {
+      if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        addSpec(node.moduleSpecifier.text);
+      }
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        addSpec(node.moduleSpecifier.text);
+      }
+      if (ts.isCallExpression(node)) {
+        if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+          const arg0 = node.arguments[0];
+          if (arg0 && ts.isStringLiteralLike(arg0)) addSpec(arg0.text);
+        } else if (ts.isIdentifier(node.expression) && node.expression.text === 'require') {
+          const arg0 = node.arguments[0];
+          if (arg0 && ts.isStringLiteralLike(arg0)) addSpec(arg0.text);
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+
+    visit(sourceFile);
+  } catch {
+    /* fallback below */
+  }
+
+  if (specs.size === 0) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+      let m: RegExpExecArray | null;
+      while ((m = DYNAMIC_IMPORT_RE.exec(content)) !== null) {
+        if (m[1] && shouldIncludeSpecifierForGraph(m[1])) specs.add(m[1]);
+      }
+      const STATIC_RE =
+        /(?:import\s+[\s\S]*?from\s+|export\s+[\s\S]*?from\s+)['"]([^'"]+)['"]/g;
+      STATIC_RE.lastIndex = 0;
+      while ((m = STATIC_RE.exec(content)) !== null) {
+        if (m[1] && shouldIncludeSpecifierForGraph(m[1])) specs.add(m[1]);
+      }
+      const SIDE_RE = /import\s+['"]([^'"]+)['"]\s*;?/g;
+      while ((m = SIDE_RE.exec(content)) !== null) {
+        if (m[1] && shouldIncludeSpecifierForGraph(m[1])) specs.add(m[1]);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return specs;
+}
+
 /** Return local import specs (./ or /) that are actually used in the file. */
 export function getUsedLocalImportSpecs(filePath: string): Set<string> {
   try {

@@ -17,6 +17,8 @@ export interface UpsertSessionMessage {
   backtrackDirty?: boolean;
   /** Optional tab label (e.g. "backtracked · file.json"). */
   displayLabel?: string;
+  /** True = level-by-level reveal, false = load all at once. */
+  progressiveReveal?: boolean;
 }
 
 export interface SessionStateMessage {
@@ -42,6 +44,22 @@ export class GraphPanel {
     | null = null;
   private onSaveBacktrack: ((sourceJsonPath: string) => void) | null = null;
   private onSaveBacktrackPrompt: ((sourceJsonPath: string) => void) | null = null;
+  private onAddNodeFromDrop:
+    | ((payload: {
+      droppedPath: string;
+      routeId: string;
+      sourceJsonPath: string;
+      dropX?: number;
+      dropY?: number;
+    }) => void)
+    | null = null;
+  private onAddRecentTreeDrag:
+    | ((payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void)
+    | null = null;
+  private onConnectNodes:
+    | ((payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void)
+    | null = null;
+  private onSaveSession: ((payload: { sourceJsonPath: string; saveToSaved?: boolean }) => void) | null = null;
   private pendingUpsert: UpsertSessionMessage | null = null;
 
   public static open(
@@ -56,11 +74,22 @@ export class GraphPanel {
       onBacktrack?: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void;
       onSaveBacktrack?: (sourceJsonPath: string) => void;
       onSaveBacktrackPrompt?: (sourceJsonPath: string) => void;
+      onAddNodeFromDrop?: (payload: {
+        droppedPath: string;
+        routeId: string;
+        sourceJsonPath: string;
+        dropX?: number;
+        dropY?: number;
+      }) => void;
+      onAddRecentTreeDrag?: (payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void;
+      onConnectNodes?: (payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void;
+      onSaveSession?: (payload: { sourceJsonPath: string; saveToSaved?: boolean }) => void;
       /** When loading JSON that was saved after backtrack, restore tab styling without inferring from filename. */
       initialSession?: {
         isBacktrackSession?: boolean;
         backtrackDirty?: boolean;
         displayLabel?: string;
+        progressiveReveal?: boolean;
       };
     }
   ): GraphPanel {
@@ -77,6 +106,7 @@ export class GraphPanel {
       sessionMode,
       isBacktrackSession: ini?.isBacktrackSession ?? false,
       backtrackDirty: ini?.backtrackDirty ?? false,
+      progressiveReveal: ini?.progressiveReveal ?? false,
     };
     if (ini?.displayLabel !== undefined) {
       msg.displayLabel = ini.displayLabel;
@@ -88,6 +118,10 @@ export class GraphPanel {
       GraphPanel.instance.onBacktrack = hooks?.onBacktrack ?? null;
       GraphPanel.instance.onSaveBacktrack = hooks?.onSaveBacktrack ?? null;
       GraphPanel.instance.onSaveBacktrackPrompt = hooks?.onSaveBacktrackPrompt ?? null;
+      GraphPanel.instance.onAddNodeFromDrop = hooks?.onAddNodeFromDrop ?? null;
+      GraphPanel.instance.onAddRecentTreeDrag = hooks?.onAddRecentTreeDrag ?? null;
+      GraphPanel.instance.onConnectNodes = hooks?.onConnectNodes ?? null;
+      GraphPanel.instance.onSaveSession = hooks?.onSaveSession ?? null;
       GraphPanel.instance.deliverUpsert(msg);
       GraphPanel.instance.reveal();
       return GraphPanel.instance;
@@ -120,6 +154,10 @@ export class GraphPanel {
       hooks?.onBacktrack ?? null,
       hooks?.onSaveBacktrack ?? null,
       hooks?.onSaveBacktrackPrompt ?? null,
+      hooks?.onAddNodeFromDrop ?? null,
+      hooks?.onAddRecentTreeDrag ?? null,
+      hooks?.onConnectNodes ?? null,
+      hooks?.onSaveSession ?? null,
       msg
     );
     GraphPanel.instance.reveal();
@@ -134,6 +172,10 @@ export class GraphPanel {
     onBacktrack: GraphPanel['onBacktrack'],
     onSaveBacktrack: GraphPanel['onSaveBacktrack'],
     onSaveBacktrackPrompt: GraphPanel['onSaveBacktrackPrompt'],
+    onAddNodeFromDrop: GraphPanel['onAddNodeFromDrop'],
+    onAddRecentTreeDrag: GraphPanel['onAddRecentTreeDrag'],
+    onConnectNodes: GraphPanel['onConnectNodes'],
+    onSaveSession: GraphPanel['onSaveSession'],
     firstUpsert: UpsertSessionMessage
   ) {
     this.panel = panel;
@@ -143,6 +185,10 @@ export class GraphPanel {
     this.onBacktrack = onBacktrack;
     this.onSaveBacktrack = onSaveBacktrack;
     this.onSaveBacktrackPrompt = onSaveBacktrackPrompt;
+    this.onAddNodeFromDrop = onAddNodeFromDrop;
+    this.onAddRecentTreeDrag = onAddRecentTreeDrag;
+    this.onConnectNodes = onConnectNodes;
+    this.onSaveSession = onSaveSession;
     this.pendingUpsert = firstUpsert;
 
     this.panel.webview.html = this.getHtmlForWebview();
@@ -191,6 +237,60 @@ export class GraphPanel {
               this.onSaveBacktrackPrompt(message.sourceJsonPath);
             }
             break;
+          case 'cmd:addNodeFromDrop':
+            if (
+              this.onAddNodeFromDrop &&
+              typeof message.droppedPath === 'string' &&
+              typeof message.routeId === 'string' &&
+              typeof message.sourceJsonPath === 'string'
+            ) {
+              this.onAddNodeFromDrop({
+                droppedPath: message.droppedPath,
+                routeId: message.routeId,
+                sourceJsonPath: message.sourceJsonPath,
+                dropX: typeof message.dropX === 'number' ? message.dropX : undefined,
+                dropY: typeof message.dropY === 'number' ? message.dropY : undefined,
+              });
+            }
+            break;
+          case 'cmd:addRecentTreeDrag':
+            if (
+              this.onAddRecentTreeDrag &&
+              typeof message.routeId === 'string' &&
+              typeof message.sourceJsonPath === 'string'
+            ) {
+              this.onAddRecentTreeDrag({
+                routeId: message.routeId,
+                sourceJsonPath: message.sourceJsonPath,
+                dropX: typeof message.dropX === 'number' ? message.dropX : undefined,
+                dropY: typeof message.dropY === 'number' ? message.dropY : undefined,
+              });
+            }
+            break;
+          case 'cmd:connectNodes':
+            if (
+              this.onConnectNodes &&
+              typeof message.fromNodeId === 'string' &&
+              typeof message.toNodeId === 'string' &&
+              typeof message.routeId === 'string' &&
+              typeof message.sourceJsonPath === 'string'
+            ) {
+              this.onConnectNodes({
+                fromNodeId: message.fromNodeId,
+                toNodeId: message.toNodeId,
+                routeId: message.routeId,
+                sourceJsonPath: message.sourceJsonPath,
+              });
+            }
+            break;
+          case 'cmd:saveSession':
+            if (this.onSaveSession && typeof message.sourceJsonPath === 'string') {
+              this.onSaveSession({
+                sourceJsonPath: message.sourceJsonPath,
+                saveToSaved: !!message.saveToSaved,
+              });
+            }
+            break;
           case 'focusNodeNotFound':
             vscode.window.showInformationMessage(
               `"${message.filePath}" is not in the current import graph. Rebuild the graph from that file if needed.`
@@ -229,6 +329,10 @@ export class GraphPanel {
     this.deliverUpsert(msg);
   }
 
+  public postWebviewMessage(message: unknown): void {
+    this.panel.webview.postMessage(message);
+  }
+
   private getHtmlForWebview(): string {
     const webview = this.panel.webview;
     const mediaUri = vscode.Uri.joinPath(this.extensionUri, 'media');
@@ -247,10 +351,13 @@ export class GraphPanel {
   <link rel="stylesheet" href="${mainCssUri}">
   <title>Import graph</title>
 </head>
-<body>
+<body ondragover="event.preventDefault();event.stopPropagation();" ondrop="event.preventDefault();event.stopPropagation();">
   <div id="graph-loading-overlay" class="visible">
     <div class="spinner"></div>
     <span>Loading file graph…</span>
+  </div>
+  <div id="graph-drop-overlay">
+    <div class="drop-hint">Drop files here to add nodes<br><small>From Explorer/Finder: hold Shift while dragging</small></div>
   </div>
 
   <div id="graph-app">
@@ -267,8 +374,10 @@ export class GraphPanel {
   <div id="stats">
     <span id="nodeCount">0</span> files &middot; <span id="edgeCount">0</span> connections
   </div>
+  <div id="dragHelp">Tip: hold Shift while dragging files into graph</div>
 
   <button id="centerBtn" title="Center graph">⊙ Center</button>
+  <button id="connectBtn" title="Connect one file to another">⇢ Connect imports</button>
 
   <div id="nodeInfoPopover" class="node-info-popover" style="display: none;" role="dialog" aria-label="Node details">
     <button type="button" id="nodeInfoClose" class="node-info-close" aria-label="Close">&times;</button>

@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { GraphData, GraphSnapshot, NodeData, EdgeData } from './types';
-import { getUsedLocalImportSpecs, getUsedPackageSpecs } from './usedImports';
+import { getAllLocalImportSpecsForGraph, getUsedPackageSpecs } from './usedImports';
 
 const IMPORT_REGEX = /(?:import\s+(?:[\s\S]*?\s+from\s+)?|(?:const|var|let)\s+\w+\s*=\s*require\s*\()\s*["'`]([^"'`]+)["'`]/g;
 
@@ -29,15 +29,63 @@ function extractImportsFromFile(filePath: string): string[] {
   }
 }
 
-function resolveLocalFilePath(baseDir: string, importPath: string): string | null {
-  if (!importPath.startsWith('.') && !importPath.startsWith('/')) return null;
-  const fullPath = path.resolve(baseDir, importPath);
+function tryResolveFileOnDisk(fullPathNoExt: string): string | null {
   const extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', ''];
   for (const ext of extensions) {
-    const candidate = ext ? (fullPath.endsWith(ext) ? fullPath : fullPath + ext) : fullPath;
-    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    const candidate = ext ? (fullPathNoExt.endsWith(ext) ? fullPathNoExt : fullPathNoExt + ext) : fullPathNoExt;
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* ignore */
+    }
     const idx = path.join(candidate, `index${ext || '.ts'}`);
-    if (fs.existsSync(idx)) return idx;
+    try {
+      if (fs.existsSync(idx) && fs.statSync(idx).isFile()) return idx;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/** Single-segment npm packages like `react`; path-alias imports like `views/foo` are not bare. */
+function isBareNpmPackage(spec: string): boolean {
+  if (spec.startsWith('.') || spec.startsWith('/')) return false;
+  if (spec.startsWith('@')) {
+    const parts = spec.split('/');
+    return parts.length <= 2;
+  }
+  return !spec.includes('/');
+}
+
+/**
+ * Resolve import spec to a project file: relative (`./x`), absolute `/`, path aliases (`views/...`, `@/...`, `~/...`).
+ */
+function resolveImportSpecifier(baseDir: string, spec: string, projectRoot: string): string | null {
+  const normRoot = path.resolve(projectRoot);
+  const underProject = (abs: string) => {
+    const r = path.resolve(abs);
+    return r === normRoot || r.startsWith(normRoot + path.sep);
+  };
+
+  if (spec.startsWith('.') || spec.startsWith('/')) {
+    const fullPath = spec.startsWith('/') ? spec : path.resolve(baseDir, spec);
+    const hit = tryResolveFileOnDisk(fullPath);
+    return hit && underProject(hit) ? hit : null;
+  }
+
+  if (isBareNpmPackage(spec)) return null;
+
+  const candidates: string[] = [];
+  if (spec.startsWith('@/') || spec.startsWith('~/')) {
+    candidates.push(path.join(projectRoot, 'src', spec.slice(2)));
+  }
+  candidates.push(path.join(projectRoot, spec));
+  candidates.push(path.join(projectRoot, 'src', spec));
+
+  for (const c of candidates) {
+    const hit = tryResolveFileOnDisk(c);
+    if (hit && underProject(hit)) return hit;
   }
   return null;
 }
@@ -77,13 +125,15 @@ interface FileNode {
   packages: string[];
   internalFiles: FileNode[];
   isCircular: boolean;
+  depth: number;
 }
 
 async function buildFileNode(
   absPath: string,
   projectRoot: string,
   visited: Set<string>,
-  useLlm: boolean
+  useLlm: boolean,
+  depth: number
 ): Promise<FileNode> {
   const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
   const fileDir = path.dirname(absPath);
@@ -96,6 +146,7 @@ async function buildFileNode(
       packages: [],
       internalFiles: [],
       isCircular: true,
+      depth,
     };
   }
   visited.add(absPath);
@@ -104,15 +155,15 @@ async function buildFileNode(
     ? await getFileSummaryFromOllama(absPath, path.basename(absPath))
     : 'File dependency';
 
-  const usedLocalSpecs = getUsedLocalImportSpecs(absPath);
+  const allLocalSpecs = getAllLocalImportSpecsForGraph(absPath);
   const usedPackages = getUsedPackageSpecs(absPath);
   const packages = Array.from(usedPackages);
   const internalFiles: FileNode[] = [];
 
-  for (const imp of usedLocalSpecs) {
-    const resolved = resolveLocalFilePath(fileDir, imp);
+  for (const imp of allLocalSpecs) {
+    const resolved = resolveImportSpecifier(fileDir, imp, projectRoot);
     if (resolved) {
-      internalFiles.push(await buildFileNode(resolved, projectRoot, visited, useLlm));
+      internalFiles.push(await buildFileNode(resolved, projectRoot, visited, useLlm, depth + 1));
     }
   }
 
@@ -123,6 +174,7 @@ async function buildFileNode(
     packages,
     internalFiles,
     isCircular: false,
+    depth,
   };
 }
 
@@ -149,6 +201,7 @@ function fileNodeToGraphSnapshot(
       id: node.relPath,
       label: node.relPath,
       title: tooltip,
+      importLevel: node.depth,
       color: {
         background: baseColor,
         border: borderColor,
@@ -188,6 +241,7 @@ function fileNodeToGraphSnapshot(
     id: routeName,
     label: routeName,
     title: `Import root: ${rootId}`,
+    importLevel: -1,
     color: {
       background: '#43A047',
       border: '#2E7D32',
@@ -223,7 +277,7 @@ export async function buildFileGraph(
     throw new Error(`File not found: ${entryPath}`);
   }
 
-  const root = await buildFileNode(absPath, projectRoot, new Set(), useLlm);
+  const root = await buildFileNode(absPath, projectRoot, new Set(), useLlm, 0);
   const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
   const routeName = `Import: ${relPath}`;
   const snapshot = fileNodeToGraphSnapshot(root, routeName);

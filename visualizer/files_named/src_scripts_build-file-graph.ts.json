@@ -1,0 +1,84 @@
+{
+  "graphSnapshots": {
+    "Import: src/scripts/build-file-graph.ts": {
+      "nodes": [
+        {
+          "id": "Import: src/scripts/build-file-graph.ts",
+          "label": "Import: src/scripts/build-file-graph.ts",
+          "title": "Import root: src/scripts/build-file-graph.ts",
+          "color": {
+            "background": "#43A047",
+            "border": "#2E7D32",
+            "highlight": {
+              "background": "#66BB6A",
+              "border": "#FFC107"
+            },
+            "hover": {
+              "background": "#66BB6A",
+              "border": "#FFC107"
+            }
+          },
+          "font": {
+            "color": "#ffffff",
+            "size": 16,
+            "face": "Inter, -apple-system, sans-serif"
+          },
+          "shape": "hexagon",
+          "size": 36,
+          "borderWidth": 1.5,
+          "borderWidthSelected": 3,
+          "margin": 10
+        },
+        {
+          "id": "src/scripts/build-file-graph.ts",
+          "label": "src/scripts/build-file-graph.ts",
+          "title": "src/scripts/build-file-graph.ts\n\nWhat it does:\nFile dependency\n\nNPM Packages:\nNone",
+          "color": {
+            "background": "#7B1FA2",
+            "border": "#4A148C",
+            "highlight": {
+              "background": "#42A5F5",
+              "border": "#FFC107"
+            },
+            "hover": {
+              "background": "#42A5F5",
+              "border": "#FFC107"
+            }
+          },
+          "font": {
+            "color": "#ffffff",
+            "size": 18,
+            "face": "Inter, -apple-system, sans-serif"
+          },
+          "shape": "box",
+          "size": 40,
+          "borderWidth": 1.5,
+          "borderWidthSelected": 3,
+          "margin": 12,
+          "isController": true
+        }
+      ],
+      "edges": [
+        {
+          "from": "Import: src/scripts/build-file-graph.ts",
+          "to": "src/scripts/build-file-graph.ts",
+          "color": {
+            "color": "rgba(255,255,255,0.3)",
+            "highlight": "#FFC107",
+            "hover": "#FFC107"
+          },
+          "width": 2,
+          "selectionWidth": 2,
+          "smooth": false
+        }
+      ],
+      "methodDeps": {},
+      "controllerMethods": {},
+      "defaultMethodId": null,
+      "controllerId": "src/scripts/build-file-graph.ts"
+    }
+  },
+  "routeNames": [
+    "Import: src/scripts/build-file-graph.ts"
+  ]
+}

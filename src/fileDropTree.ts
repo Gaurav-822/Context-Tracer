@@ -2,38 +2,88 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-const VALID_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
 const SOFT_DELETED_KEY = 'apiGraphVisualizer.softDeleted';
+const DROPPED_FILES_KEY = 'apiGraphVisualizer.droppedFiles';
 
 const SECTION_FEATURES = 'section:features';
 const SECTION_SAVED = 'section:saved';
-const SECTION_FILES = 'section:files';
 const ARCHIVED_ID = 'archived-section';
 
-/** id: wsfile/<wsIndex>/<posixRelPath> */
 const WS_FILE_PREFIX = 'wsfile/';
 const WS_DIR_PREFIX = 'wsdir/';
 const WS_ROOT_PREFIX = 'wsroot/';
-
-function isValidFile(filePath: string): boolean {
-  const ext = path.extname(filePath).toLowerCase();
-  return VALID_EXTS.includes(ext);
-}
 
 function toPosix(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
-function shouldSkipDirName(name: string): boolean {
-  return name === 'node_modules' || name === '.git' || name === '.svn' || name === '.hg';
-}
-
-/** Convert relative path to safe filename for visualizer/files_named/ */
 export function toFileNamedBasename(relPath: string): string {
   return relPath.replace(/[/\\]/g, '_').replace(/\s/g, '_') + '.json';
 }
 
-/** Scan visualizer/files_named/ and return relPaths from JSON routeNames */
+// ── Directory listing cache ──────────────────────────────────────────
+interface DirCacheEntry {
+  dirs: { name: string; abs: string }[];
+  files: { name: string; abs: string }[];
+  timestamp: number;
+}
+const dirCache = new Map<string, DirCacheEntry>();
+const DIR_CACHE_TTL_MS = 5_000;
+
+async function listDirAsync(dirAbs: string): Promise<DirCacheEntry> {
+  const cached = dirCache.get(dirAbs);
+  if (cached && Date.now() - cached.timestamp < DIR_CACHE_TTL_MS) return cached;
+
+  const dirUri = vscode.Uri.file(dirAbs);
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dirUri);
+  } catch {
+    const empty: DirCacheEntry = { dirs: [], files: [], timestamp: Date.now() };
+    dirCache.set(dirAbs, empty);
+    return empty;
+  }
+
+  const dirs: { name: string; abs: string }[] = [];
+  const files: { name: string; abs: string }[] = [];
+  for (const [name, type] of entries) {
+    if (type === vscode.FileType.Directory) {
+      dirs.push({ name, abs: path.join(dirAbs, name) });
+    } else if (
+      type === vscode.FileType.File ||
+      type === vscode.FileType.SymbolicLink ||
+      type === vscode.FileType.Unknown
+    ) {
+      files.push({ name, abs: path.join(dirAbs, name) });
+    }
+  }
+  dirs.sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+
+  const entry: DirCacheEntry = { dirs, files, timestamp: Date.now() };
+  dirCache.set(dirAbs, entry);
+  return entry;
+}
+
+// ── Saved/files_named scan (lazy, cached) ────────────────────────────
+let savedCountCache: { count: number; ts: number } | null = null;
+const SAVED_CACHE_TTL = 10_000;
+
+async function getSavedCountFast(): Promise<number> {
+  if (savedCountCache && Date.now() - savedCountCache.ts < SAVED_CACHE_TTL) return savedCountCache.count;
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return 0;
+  const dirUri = vscode.Uri.file(path.join(root, 'visualizer', 'backtracked'));
+  try {
+    const entries = await vscode.workspace.fs.readDirectory(dirUri);
+    const count = entries.filter(([n]) => n.endsWith('.json')).length;
+    savedCountCache = { count, ts: Date.now() };
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
 export function scanFilesNamed(projectRoot: string): string[] {
   const dir = path.join(projectRoot, 'visualizer', 'files_named');
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return [];
@@ -42,7 +92,6 @@ export function scanFilesNamed(projectRoot: string): string[] {
     for (const name of fs.readdirSync(dir)) {
       if (!name.endsWith('.json')) continue;
       const fp = path.join(dir, name);
-      if (!fs.statSync(fp).isFile()) continue;
       try {
         const raw = fs.readFileSync(fp, 'utf-8');
         const data = JSON.parse(raw) as { routeNames?: string[] };
@@ -50,17 +99,12 @@ export function scanFilesNamed(projectRoot: string): string[] {
         if (typeof rn === 'string' && rn.startsWith('Import: ')) {
           paths.push(rn.replace(/^Import:\s*/, ''));
         }
-      } catch {
-        /* skip invalid json */
-      }
+      } catch { /* skip */ }
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return paths;
 }
 
-/** Scan visualizer/backtracked and return saved graph JSON absolute paths. */
 export function scanSavedBacktrackedJson(projectRoot: string): string[] {
   const dir = path.join(projectRoot, 'visualizer', 'backtracked');
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return [];
@@ -69,20 +113,13 @@ export function scanSavedBacktrackedJson(projectRoot: string): string[] {
     for (const name of fs.readdirSync(dir)) {
       if (!name.endsWith('.json')) continue;
       const fp = path.join(dir, name);
-      if (!fs.statSync(fp).isFile()) continue;
       files.push(fp);
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
   return files;
 }
 
-/**
- * Parse workspace file tree id → posix rel path (from workspace folder root).
- * Returns undefined if not a workspace file id.
- */
 export function relPathFromWorkspaceTreeId(id: string | undefined): string | undefined {
   if (!id || !id.startsWith(WS_FILE_PREFIX)) return undefined;
   const rest = id.slice(WS_FILE_PREFIX.length);
@@ -95,29 +132,31 @@ export class FileDropTreeProvider
   implements vscode.TreeDataProvider<vscode.TreeItem>, vscode.TreeDragAndDropController<vscode.TreeItem>
 {
   dropMimeTypes = ['text/uri-list', 'files'];
-  dragMimeTypes: readonly string[] = [];
+  dragMimeTypes: readonly string[] = ['text/uri-list', 'text/plain'];
 
   private _onDidChangeTreeData = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   private droppedFiles: string[] = [];
   useLlm = false;
   private softDeleted = new Set<string>();
+  private lastDraggedRelPaths: string[] = [];
+  private savedCountRefreshInFlight = false;
+  private hasTriggeredInitialSavedCountRefresh = false;
 
-  constructor(
-    private readonly context: vscode.ExtensionContext,
-    private onBuild: (filePathOrUri: string | vscode.Uri, useLlm: boolean) => void,
-    private onBuildMany?: (paths: (string | vscode.Uri)[], useLlm: boolean) => void
-  ) {
+  constructor(private readonly context: vscode.ExtensionContext) {
     this.loadState();
   }
 
   private loadState(): void {
     const sd = this.context.workspaceState.get<string[]>(SOFT_DELETED_KEY);
     if (Array.isArray(sd)) this.softDeleted = new Set(sd);
+    const dropped = this.context.workspaceState.get<string[]>(DROPPED_FILES_KEY);
+    if (Array.isArray(dropped)) this.droppedFiles = [...new Set(dropped)];
   }
 
   private saveState(): void {
     this.context.workspaceState.update(SOFT_DELETED_KEY, [...this.softDeleted]);
+    this.context.workspaceState.update(DROPPED_FILES_KEY, [...this.droppedFiles]);
   }
 
   toggleUseLlm(): void {
@@ -133,11 +172,12 @@ export class FileDropTreeProvider
     const active = fromDisk.filter((p) => !this.softDeleted.has(p));
     const merged = new Set([...this.droppedFiles, ...active]);
     this.droppedFiles = [...merged];
+    this.saveState();
     this._onDidChangeTreeData.fire();
   }
 
-  /** Refresh tree sections that depend on saved graph files. */
   refreshSavedGraphs(): void {
+    savedCountCache = null;
     this._onDidChangeTreeData.fire();
   }
 
@@ -168,7 +208,6 @@ export class FileDropTreeProvider
     this._onDidChangeTreeData.fire();
   }
 
-  /** Remove from both lists (used after hard delete) */
   removeCompletely(relPaths: string[]): void {
     const set = new Set(relPaths);
     this.droppedFiles = this.droppedFiles.filter((p) => !set.has(p));
@@ -194,104 +233,35 @@ export class FileDropTreeProvider
     this._onDidChangeTreeData.fire();
   }
 
-  getDroppedFiles(): string[] {
-    return [...this.droppedFiles];
+  getDroppedFiles(): string[] { return [...this.droppedFiles]; }
+  getSoftDeleted(): string[] { return [...this.softDeleted]; }
+  hasSoftDeleted(relPath: string): boolean { return this.softDeleted.has(relPath); }
+
+  consumeLastDraggedFiles(): string[] {
+    const out = [...this.lastDraggedRelPaths];
+    this.lastDraggedRelPaths = [];
+    return out;
   }
 
-  getSoftDeleted(): string[] {
-    return [...this.softDeleted];
-  }
+  getTreeItem(element: vscode.TreeItem): vscode.TreeItem { return element; }
 
-  hasSoftDeleted(relPath: string): boolean {
-    return this.softDeleted.has(relPath);
-  }
-
-  getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
-    return element;
-  }
-
-  private listWorkspaceRoots(): vscode.TreeItem[] {
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders?.length) {
-      const empty = new vscode.TreeItem('No folder open', vscode.TreeItemCollapsibleState.None);
-      empty.description = 'Open a workspace folder';
-      return [empty];
-    }
-    if (folders.length === 1) {
-      return this.listDirEntries(0, '');
-    }
-    return folders.map((wf, i) => {
-      const ti = new vscode.TreeItem(wf.name, vscode.TreeItemCollapsibleState.Collapsed);
-      ti.id = `${WS_ROOT_PREFIX}${i}`;
-      ti.resourceUri = wf.uri;
-      ti.iconPath = new vscode.ThemeIcon('folder-opened');
-      ti.tooltip = wf.uri.fsPath;
-      return ti;
+  private refreshSavedCountInBackground(): void {
+    if (this.savedCountRefreshInFlight) return;
+    this.savedCountRefreshInFlight = true;
+    void (async () => {
+      const before = savedCountCache?.count;
+      const after = await getSavedCountFast();
+      if (before !== after) {
+        this._onDidChangeTreeData.fire();
+      }
+    })().finally(() => {
+      this.savedCountRefreshInFlight = false;
     });
   }
 
-  private listDirEntries(wsIndex: number, relPosix: string): vscode.TreeItem[] {
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders?.[wsIndex]) return [];
-    const rootAbs = folders[wsIndex].uri.fsPath;
-    const dirAbs = relPosix ? path.join(rootAbs, relPosix) : rootAbs;
-    let dirents: fs.Dirent[];
-    try {
-      dirents = fs.readdirSync(dirAbs, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-
-    const dirs: { name: string; abs: string }[] = [];
-    const files: { name: string; abs: string }[] = [];
-    for (const d of dirents) {
-      const name = d.name;
-      if (d.isDirectory()) {
-        if (shouldSkipDirName(name)) continue;
-        dirs.push({ name, abs: path.join(dirAbs, name) });
-      } else if (d.isFile() && isValidFile(name)) {
-        files.push({ name, abs: path.join(dirAbs, name) });
-      }
-    }
-    dirs.sort((a, b) => a.name.localeCompare(b.name));
-    files.sort((a, b) => a.name.localeCompare(b.name));
-
-    const items: vscode.TreeItem[] = [];
-    for (const { name, abs } of dirs) {
-      const childRel = relPosix ? `${relPosix}/${name}` : name;
-      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Collapsed);
-      ti.id = `${WS_DIR_PREFIX}${wsIndex}/${childRel}`;
-      ti.resourceUri = vscode.Uri.file(abs);
-      ti.iconPath = new vscode.ThemeIcon('folder');
-      ti.tooltip = toPosix(path.relative(rootAbs, abs));
-      ti.contextValue = 'workspaceFolder';
-      items.push(ti);
-    }
-    for (const { name, abs } of files) {
-      const childRel = relPosix ? `${relPosix}/${name}` : name;
-      const relForId = toPosix(childRel);
-      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.None);
-      ti.id = `${WS_FILE_PREFIX}${wsIndex}/${relForId}`;
-      ti.resourceUri = vscode.Uri.file(abs);
-      ti.description = relForId;
-      ti.iconPath = new vscode.ThemeIcon('file-code');
-      ti.tooltip = `Open import map for ${relForId}`;
-      ti.contextValue = 'workspaceFile';
-      const uri = vscode.Uri.file(abs);
-      ti.command = {
-        command: 'apiGraphVisualizer.buildFromResource',
-        title: 'Open map',
-        arguments: [uri],
-      };
-      items.push(ti);
-    }
-    return items;
-  }
-
+  // ── getChildren (fully async, no sync fs on hot path) ──────────────
   async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
-    if (element?.id === 'feature:llm') {
-      return [];
-    }
+    if (element?.id === 'feature:llm') return [];
 
     if (element?.id === SECTION_FEATURES) {
       const llmItem = new vscode.TreeItem('Use AI', vscode.TreeItemCollapsibleState.None);
@@ -326,14 +296,10 @@ export class FileDropTreeProvider
       });
     }
 
-    if (element?.id === SECTION_FILES) {
-      return this.listWorkspaceRoots();
-    }
-
     if (element?.id?.startsWith(WS_ROOT_PREFIX)) {
       const idx = parseInt(element.id.slice(WS_ROOT_PREFIX.length), 10);
       if (Number.isNaN(idx)) return [];
-      return this.listDirEntries(idx, '');
+      return this.listDirEntriesAsync(idx, '');
     }
 
     if (element?.id?.startsWith(WS_DIR_PREFIX)) {
@@ -343,7 +309,7 @@ export class FileDropTreeProvider
       const wsIndex = parseInt(rest.slice(0, slash), 10);
       if (Number.isNaN(wsIndex)) return [];
       const relPosix = rest.slice(slash + 1);
-      return this.listDirEntries(wsIndex, relPosix);
+      return this.listDirEntriesAsync(wsIndex, relPosix);
     }
 
     if (element?.id === ARCHIVED_ID) {
@@ -357,6 +323,7 @@ export class FileDropTreeProvider
       });
     }
 
+    // Root level: return section headers only (minimal I/O).
     const items: vscode.TreeItem[] = [];
 
     const featuresSection = new vscode.TreeItem('Features', vscode.TreeItemCollapsibleState.Expanded);
@@ -366,9 +333,11 @@ export class FileDropTreeProvider
     featuresSection.contextValue = 'sectionHeader';
     items.push(featuresSection);
 
-    const folders = vscode.workspace.workspaceFolders;
-    const root = folders?.[0]?.uri.fsPath;
-    const savedCount = root ? scanSavedBacktrackedJson(root).length : 0;
+    const savedCount = savedCountCache?.count ?? 0;
+    if (!this.hasTriggeredInitialSavedCountRefresh) {
+      this.hasTriggeredInitialSavedCountRefresh = true;
+      this.refreshSavedCountInBackground();
+    }
     const savedSection = new vscode.TreeItem(
       'Saved',
       savedCount > 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
@@ -379,12 +348,7 @@ export class FileDropTreeProvider
     savedSection.contextValue = 'sectionHeader';
     items.push(savedSection);
 
-    const filesSection = new vscode.TreeItem('Files', vscode.TreeItemCollapsibleState.Expanded);
-    filesSection.id = SECTION_FILES;
-    filesSection.description = 'Workspace';
-    filesSection.iconPath = new vscode.ThemeIcon('folder');
-    filesSection.contextValue = 'sectionHeader';
-    items.push(filesSection);
+    items.push(...this.listWorkspaceRootsAsync());
 
     if (this.softDeleted.size > 0) {
       const archivedSection = new vscode.TreeItem('Archived', vscode.TreeItemCollapsibleState.Collapsed);
@@ -398,60 +362,93 @@ export class FileDropTreeProvider
     return items;
   }
 
+  // ── Async workspace roots ──────────────────────────────────────────
+  private listWorkspaceRootsAsync(): vscode.TreeItem[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) {
+      const empty = new vscode.TreeItem('No folder open', vscode.TreeItemCollapsibleState.None);
+      empty.description = 'Open a workspace folder';
+      return [empty];
+    }
+    return folders.map((wf, i) => {
+      const ti = new vscode.TreeItem(wf.name, vscode.TreeItemCollapsibleState.Collapsed);
+      ti.id = `${WS_ROOT_PREFIX}${i}`;
+      ti.resourceUri = wf.uri;
+      ti.iconPath = new vscode.ThemeIcon('folder-opened');
+      ti.tooltip = wf.uri.fsPath;
+      return ti;
+    });
+  }
+
+  // ── Async directory listing (uses vscode.workspace.fs + cache) ─────
+  private async listDirEntriesAsync(wsIndex: number, relPosix: string): Promise<vscode.TreeItem[]> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.[wsIndex]) return [];
+    const rootAbs = folders[wsIndex].uri.fsPath;
+    const dirAbs = relPosix ? path.join(rootAbs, relPosix) : rootAbs;
+
+    const { dirs, files } = await listDirAsync(dirAbs);
+
+    const items: vscode.TreeItem[] = [];
+    for (const { name, abs } of dirs) {
+      const childRel = relPosix ? `${relPosix}/${name}` : name;
+      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Collapsed);
+      ti.id = `${WS_DIR_PREFIX}${wsIndex}/${childRel}`;
+      ti.resourceUri = vscode.Uri.file(abs);
+      ti.iconPath = new vscode.ThemeIcon('folder');
+      ti.tooltip = toPosix(path.relative(rootAbs, abs));
+      ti.contextValue = 'workspaceFolder';
+      items.push(ti);
+    }
+    for (const { name, abs } of files) {
+      const childRel = relPosix ? `${relPosix}/${name}` : name;
+      const relForId = toPosix(childRel);
+      const ti = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.None);
+      ti.id = `${WS_FILE_PREFIX}${wsIndex}/${relForId}`;
+      ti.resourceUri = vscode.Uri.file(abs);
+      ti.description = relForId;
+      ti.iconPath = new vscode.ThemeIcon('file');
+      ti.tooltip = relForId;
+      ti.contextValue = 'workspaceFile';
+      ti.command = {
+        command: 'apiGraphVisualizer.loadImportRoute',
+        title: 'Open graph',
+        arguments: [undefined, `Import: ${relForId}`],
+      };
+      items.push(ti);
+    }
+    return items;
+  }
+
   async handleDrop(
     _target: vscode.TreeItem | undefined,
+    _dataTransfer: vscode.DataTransfer,
+    _token: vscode.CancellationToken
+  ): Promise<void> {
+    // Intentionally no-op: file tree interactions should stay separate from graph generation.
+  }
+
+  async handleDrag(
+    source: readonly vscode.TreeItem[],
     dataTransfer: vscode.DataTransfer,
     _token: vscode.CancellationToken
   ): Promise<void> {
     const uris: vscode.Uri[] = [];
-
-    const fileItem = dataTransfer.get('files');
-    if (fileItem) {
-      const file = fileItem.asFile();
-      if (file?.uri && isValidFile(file.uri.fsPath)) uris.push(file.uri);
-    }
-
-    if (uris.length === 0) {
-      const uriItem = dataTransfer.get('text/uri-list');
-      if (uriItem) {
-        const s = await uriItem.asString();
-        const lines = s.trim().split(/[\r\n]+/).filter(Boolean);
-        for (const uriStr of lines) {
-          try {
-            const parsed = vscode.Uri.parse(uriStr);
-            if ((parsed.scheme === 'file' || parsed.scheme === 'vscode-file') && isValidFile(parsed.fsPath)) {
-              uris.push(parsed);
-              continue;
-            }
-          } catch {
-            /* fallback */
-          }
-          if (uriStr.startsWith('file://') || uriStr.startsWith('vscode-file://') || uriStr.startsWith('vscode://file/')) {
-            let pathPart = uriStr
-              .replace(/^file:\/\/\/?/i, '')
-              .replace(/^vscode-file:\/\/[^/]+\//i, '')
-              .replace(/^vscode:\/\/file\//i, '');
-            if (pathPart) {
-              pathPart = decodeURIComponent(pathPart);
-              if (!pathPart.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(pathPart)) pathPart = '/' + pathPart;
-              const u = vscode.Uri.file(pathPart);
-              if (isValidFile(u.fsPath)) uris.push(u);
-            }
-          }
-        }
+    const relPaths: string[] = [];
+    for (const item of source) {
+      if (item.resourceUri && (item.contextValue === 'workspaceFile' || item.contextValue === 'savedGraphFile')) {
+        uris.push(item.resourceUri);
+      }
+      if (item.contextValue === 'workspaceFile') {
+        const rel = relPathFromWorkspaceTreeId(item.id);
+        if (rel) relPaths.push(rel);
       }
     }
-
-    if (uris.length === 0) {
-      vscode.window.showWarningMessage('Select .ts, .tsx, .js, .jsx, .mjs, or .cjs files.');
-      return;
-    }
-    if (uris.length === 1) {
-      this.onBuild(uris[0], this.useLlm);
-    } else if (this.onBuildMany) {
-      this.onBuildMany(uris, this.useLlm);
-    } else {
-      for (const u of uris) this.onBuild(u, this.useLlm);
-    }
+    this.lastDraggedRelPaths = [...new Set(relPaths)];
+    if (uris.length === 0) return;
+    const uriList = uris.map((u) => u.toString()).join('\n');
+    const plain = uris.map((u) => u.fsPath).join('\n');
+    dataTransfer.set('text/uri-list', new vscode.DataTransferItem(uriList));
+    dataTransfer.set('text/plain', new vscode.DataTransferItem(plain));
   }
 }
