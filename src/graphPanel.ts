@@ -3,7 +3,7 @@ import { GraphData } from './types';
 
 export type GraphPanelLoadMode = 'newWindow' | 'refreshOpenOrOpen';
 
-/** Sent to webview to add/update a graph session (tabs live inside the single Import graph panel). */
+/** Sent to webview to add/update a graph session (tabs live inside the single Map View panel). */
 export interface UpsertSessionMessage {
   type: 'upsertSession';
   sourceJsonPath: string;
@@ -31,7 +31,7 @@ export interface SessionStateMessage {
 
 export class GraphPanel {
   private static readonly viewType = 'apiGraphVisualizer.graphView';
-  /** Single Import graph editor tab; multiple graphs are tabs inside its webview. */
+  /** Single Map View editor tab; multiple graphs are tabs inside its webview. */
   static instance: GraphPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
@@ -133,7 +133,7 @@ export class GraphPanel {
 
     const webviewPanel = vscode.window.createWebviewPanel(
       GraphPanel.viewType,
-      'Import graph',
+      'Map View',
       column || vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -349,7 +349,7 @@ export class GraphPanel {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data:;">
   <link rel="stylesheet" href="${mainCssUri}">
-  <title>Import graph</title>
+  <title>Map View</title>
 </head>
 <body ondragover="event.preventDefault();event.stopPropagation();" ondrop="event.preventDefault();event.stopPropagation();">
   <div id="graph-loading-overlay" class="visible">
@@ -361,7 +361,7 @@ export class GraphPanel {
   </div>
 
   <div id="graph-app">
-    <div id="graph-tab-bar" class="graph-tab-bar" role="tablist" aria-label="Open import graphs"></div>
+    <div id="graph-tab-bar" class="graph-tab-bar" role="tablist" aria-label="Open map views"></div>
     <div id="mynetwork" class="graph-canvas-wrap"></div>
   </div>
 

@@ -130,7 +130,7 @@
       "activitybar": [
         {
           "id": "api-graph-sidebar",
-          "title": "Import graph",
+          "title": "Explorer Map",
           "icon": "media/icon.svg"
         }
       ]
@@ -145,12 +145,12 @@
       ]
     },
     "configuration": {
-      "title": "Import graph",
+      "title": "Explorer Map",
       "properties": {
         "apiGraphVisualizer.autoOpenGraphOnActiveEditor": {
           "type": "boolean",
           "default": false,
-          "description": "Deprecated: automatic graph opening from active editor is disabled; use Import graph tree actions."
+          "description": "Deprecated: automatic graph opening from active editor is disabled; use Explorer Map tree actions."
         }
       }
     }
