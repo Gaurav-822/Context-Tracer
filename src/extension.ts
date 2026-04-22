@@ -1,9 +1,13 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { FileDropTreeProvider, relPathFromWorkspaceTreeId, toFileNamedBasename } from './fileDropTree';
+import { FileDropTreeProvider, relPathFromWorkspaceTreeId, scanSavedBacktrackedJson, toFileNamedBasename } from './fileDropTree';
 import type { GraphData } from './types';
 import type { GraphPanelLoadMode, UpsertSessionMessage } from './graphPanel';
+import {
+  SearchSidebarViewProvider,
+  SidebarTreeNode,
+} from './searchSidebarView';
 
 // Heavy modules loaded lazily on first use (keeps activation instant).
 async function lazyGraphPanel() { return import('./graphPanel'); }
@@ -69,18 +73,45 @@ let fileDropTreeView: vscode.TreeView<vscode.TreeItem> | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   fileDropProvider = new FileDropTreeProvider(context);
-  fileDropTreeView = vscode.window.createTreeView('apiGraphVisualizer.fileDropTree', {
-    treeDataProvider: fileDropProvider,
-    dragAndDropController: fileDropProvider,
+  const searchViewProvider = new SearchSidebarViewProvider(context.extensionUri, {
+    onRequestPanelData: async (params) => ({
+      useLlm: fileDropProvider.useLlm,
+      saved: listSavedGraphs(),
+      tree: await buildWorkspaceTree(params),
+    }),
+    onToggleLlm: async () => {
+      fileDropProvider.toggleUseLlm();
+      return fileDropProvider.useLlm;
+    },
+    onOpenSaved: async (absPath) => {
+      await loadAndShowFileGraph(context, absPath);
+    },
+    onCreateFile: async () => {
+      await createWorkspaceFile();
+    },
+    onCreateFolder: async () => {
+      await createWorkspaceFolder();
+    },
+    onOpenResult: async ({ resultType, absPath }) => {
+      if (resultType === 'folder') {
+        await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(absPath));
+        return;
+      }
+      await buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
+    },
   });
-  context.subscriptions.push(fileDropTreeView);
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchViewProvider));
 
-  context.subscriptions.push(
-    fileDropTreeView.onDidChangeVisibility((e) => {
+  const maybeViewVisibilityListener = fileDropTreeView
+    ? fileDropTreeView.onDidChangeVisibility((e) => {
       if (e.visible) {
         getGraphPanel()?.instance?.requestGraphMeta();
       }
-    }),
+    })
+    : undefined;
+
+  context.subscriptions.push(
+    ...(maybeViewVisibilityListener ? [maybeViewVisibilityListener] : []),
     vscode.commands.registerCommand('apiGraphVisualizer.open', () => { void openVisualizer(context); }),
     vscode.commands.registerCommand('apiGraphVisualizer.focusInGraph', () => focusCurrentFileInGraph()),
     vscode.commands.registerCommand('apiGraphVisualizer.buildFromCurrentFile', () => { void buildFromCurrentFile(context); }),
@@ -202,6 +233,199 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // Graph opens only from this extension's actions (tree click/commands), not Explorer/editor focus.
+}
+
+async function createWorkspaceFile(): Promise<void> {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!root) {
+    vscode.window.showWarningMessage('Open a workspace to create files.');
+    return;
+  }
+  const rel = await vscode.window.showInputBox({
+    title: 'Create New File',
+    prompt: 'Enter file path relative to workspace root',
+    placeHolder: 'src/newFile.ts',
+    ignoreFocusOut: true,
+  });
+  if (!rel) return;
+  const clean = rel.replace(/^[/\\]+/, '').trim();
+  if (!clean) return;
+  const uri = vscode.Uri.joinPath(root, ...clean.split('/'));
+  const dir = vscode.Uri.joinPath(root, ...clean.split('/').slice(0, -1));
+  try {
+    await vscode.workspace.fs.createDirectory(dir);
+    await vscode.workspace.fs.writeFile(uri, new Uint8Array());
+    await vscode.commands.executeCommand('vscode.open', uri);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Could not create file: ${msg}`);
+  }
+}
+
+async function createWorkspaceFolder(): Promise<void> {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!root) {
+    vscode.window.showWarningMessage('Open a workspace to create folders.');
+    return;
+  }
+  const rel = await vscode.window.showInputBox({
+    title: 'Create New Folder',
+    prompt: 'Enter folder path relative to workspace root',
+    placeHolder: 'src/new-folder',
+    ignoreFocusOut: true,
+  });
+  if (!rel) return;
+  const clean = rel.replace(/^[/\\]+/, '').trim();
+  if (!clean) return;
+  const dir = vscode.Uri.joinPath(root, ...clean.split('/'));
+  try {
+    await vscode.workspace.fs.createDirectory(dir);
+    await vscode.commands.executeCommand('revealInExplorer', dir);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Could not create folder: ${msg}`);
+  }
+}
+
+async function buildWorkspaceTree(params: {
+  query?: string;
+  mode?: 'files' | 'folders';
+  matchCase?: boolean;
+  wholeWord?: boolean;
+  useRegex?: boolean;
+}): Promise<SidebarTreeNode[]> {
+  const rawQuery = String(params.query || '').trim();
+  const mode = params.mode || 'files';
+  const matchCase = !!params.matchCase;
+  const wholeWord = !!params.wholeWord;
+  const useRegex = !!params.useRegex;
+  const include = '**/*';
+  const exclude = '**/{node_modules,.git,dist,build,out,coverage}/**';
+  const files = await vscode.workspace.findFiles(include, exclude, 5000);
+
+  interface MutableNode {
+    type: 'file' | 'folder';
+    label: string;
+    relPath: string;
+    absPath: string;
+    children?: Map<string, MutableNode>;
+  }
+
+  const roots = new Map<string, MutableNode>();
+  for (const file of files) {
+    const wf = vscode.workspace.getWorkspaceFolder(file);
+    if (!wf) continue;
+    const rel = path.relative(wf.uri.fsPath, file.fsPath).replace(/\\/g, '/');
+    const parts = rel.split('/').filter(Boolean);
+    if (parts.length === 0) continue;
+
+    let root = roots.get(wf.uri.fsPath);
+    if (!root) {
+      root = {
+        type: 'folder',
+        label: wf.name,
+        relPath: '',
+        absPath: wf.uri.fsPath,
+        children: new Map<string, MutableNode>(),
+      };
+      roots.set(wf.uri.fsPath, root);
+    }
+
+    let cursor = root;
+    let runningRel = '';
+    for (let i = 0; i < parts.length; i += 1) {
+      const part = parts[i];
+      runningRel = runningRel ? `${runningRel}/${part}` : part;
+      const isLast = i === parts.length - 1;
+      if (!cursor.children) cursor.children = new Map<string, MutableNode>();
+      const existing = cursor.children.get(part);
+      if (existing) {
+        cursor = existing;
+        continue;
+      }
+      const newNode: MutableNode = isLast
+        ? { type: 'file', label: part, relPath: runningRel, absPath: path.join(wf.uri.fsPath, runningRel) }
+        : { type: 'folder', label: part, relPath: runningRel, absPath: path.join(wf.uri.fsPath, runningRel), children: new Map<string, MutableNode>() };
+      cursor.children.set(part, newNode);
+      cursor = newNode;
+    }
+  }
+
+  const toSerializable = (node: MutableNode): SidebarTreeNode => {
+    const out: SidebarTreeNode = {
+      type: node.type,
+      label: node.label,
+      relPath: node.relPath,
+      absPath: node.absPath,
+    };
+    if (node.children && node.children.size > 0) {
+      const children = [...node.children.values()].sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
+        return a.label.localeCompare(b.label);
+      });
+      out.children = children.map(toSerializable);
+    }
+    return out;
+  };
+
+  const rootNodes = [...roots.values()].sort((a, b) => a.label.localeCompare(b.label)).map(toSerializable);
+  if (!rawQuery) return rootNodes;
+
+  const escapeRegex = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const makeMatcher = () => {
+    if (useRegex) {
+      try {
+        const patt = wholeWord ? `\\b(?:${rawQuery})\\b` : rawQuery;
+        const flags = matchCase ? '' : 'i';
+        const re = new RegExp(patt, flags);
+        return (text: string) => re.test(text);
+      } catch {
+        return (_text: string) => false;
+      }
+    }
+    const q = matchCase ? rawQuery : rawQuery.toLowerCase();
+    if (wholeWord) {
+      const re = new RegExp(`\\b${escapeRegex(q)}\\b`, matchCase ? '' : 'i');
+      return (text: string) => re.test(text);
+    }
+    return (text: string) => {
+      const t = matchCase ? text : text.toLowerCase();
+      return t.includes(q);
+    };
+  };
+  const isMatch = makeMatcher();
+
+  const keepNode = (node: SidebarTreeNode, forceKeepSubtree = false): SidebarTreeNode | null => {
+    if (forceKeepSubtree) {
+      return {
+        ...node,
+        children: (node.children || []).map((c) => keepNode(c, true)).filter((n): n is SidebarTreeNode => !!n),
+      };
+    }
+    const rel = String(node.relPath || '');
+    const folderMatches = node.type === 'folder' && mode === 'folders' && isMatch(rel);
+    const fileMatches = node.type === 'file' && mode === 'files' && isMatch(rel);
+    if (node.type === 'file') return fileMatches ? node : null;
+    const keptChildren = (node.children || [])
+      .map((c) => keepNode(c, mode === 'folders' && folderMatches))
+      .filter((n): n is SidebarTreeNode => !!n);
+    if (folderMatches || keptChildren.length > 0) {
+      return { ...node, children: keptChildren };
+    }
+    return null;
+  };
+
+  return rootNodes.map(keepNode).filter((n): n is SidebarTreeNode => !!n);
+}
+
+function listSavedGraphs(): { label: string; absPath: string; relPath: string }[] {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return [];
+  return scanSavedBacktrackedJson(root).map((absPath) => ({
+    label: path.basename(absPath),
+    absPath,
+    relPath: path.relative(root, absPath).replace(/\\/g, '/'),
+  }));
 }
 
 async function presentLiveImportGraph(

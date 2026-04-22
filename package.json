@@ -138,7 +138,7 @@
     "views": {
       "api-graph-sidebar": [
         {
-          "type": "tree",
+          "type": "webview",
           "id": "apiGraphVisualizer.fileDropTree",
           "name": "Build From File"
         }
