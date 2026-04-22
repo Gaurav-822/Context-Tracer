@@ -5,13 +5,13 @@
 import * as path from 'path';
 import { GraphData, GraphSnapshot, NodeData, EdgeData } from './types';
 
-function makeBacktrackNode(rel: string): NodeData {
+function makeBacktrackNode(rel: string, importLevel?: number): NodeData {
   const base = '#1E88E5';
   const border = '#F9A825';
-  return {
+  const n: NodeData = {
     id: rel,
     label: path.basename(rel),
-    title: `${rel}\n\nWhat it does:\n(Added via backtrack — from open editors)\n\nNPM Packages:\nNone`,
+    title: `${rel}\n\nWhat it does:\n(Added via Next — files in this workspace that import the selected file)\n\nNPM Packages:\nNone`,
     color: {
       background: base,
       border,
@@ -25,6 +25,8 @@ function makeBacktrackNode(rel: string): NodeData {
     borderWidthSelected: 3,
     margin: 12,
   };
+  if (typeof importLevel === 'number') n.importLevel = importLevel;
+  return n;
 }
 
 function makeBacktrackEdge(from: string, to: string): EdgeData {
@@ -45,13 +47,15 @@ export interface BacktrackMergeResult {
 }
 
 /**
- * Adds nodes only for closure paths not already in the snapshot, then edges for backtrack importer links.
+ * Adds nodes only for closure paths not already in the snapshot, then edges for importer links.
+ * @param newNodeImportLevel When set, assigned to newly added file nodes so layered navigation includes them.
  */
 export function mergeBacktrackIntoRoute(
   graphData: GraphData,
   routeId: string,
   closureRelPaths: string[],
-  edges: Array<{ from: string; to: string }>
+  edges: Array<{ from: string; to: string }>,
+  newNodeImportLevel?: number
 ): BacktrackMergeResult {
   const snap = graphData.graphSnapshots[routeId];
   if (!snap) return { newNodesAdded: 0, newEdgesAdded: 0 };
@@ -65,7 +69,7 @@ export function mergeBacktrackIntoRoute(
     if (!rel || rel.includes('::')) continue;
     if (ids.has(rel)) continue;
     ids.add(rel);
-    snap.nodes.push(makeBacktrackNode(rel));
+    snap.nodes.push(makeBacktrackNode(rel, newNodeImportLevel));
     newNodesAdded += 1;
   }
 
@@ -76,6 +80,17 @@ export function mergeBacktrackIntoRoute(
     edgeKeys.add(k);
     snap.edges.push(makeBacktrackEdge(e.from, e.to));
     newEdgesAdded += 1;
+  }
+
+  // Pull every direct importer onto the same import row as new nodes so ▲/▼ level nav reaches them.
+  if (typeof newNodeImportLevel === 'number') {
+    for (const e of edges) {
+      const node = snap.nodes.find((x) => x.id === e.to);
+      if (!node) continue;
+      const cur = node.importLevel;
+      node.importLevel =
+        typeof cur === 'number' ? Math.min(cur, newNodeImportLevel) : newNodeImportLevel;
+    }
   }
 
   return { newNodesAdded, newEdgesAdded };

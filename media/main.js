@@ -7,13 +7,15 @@
   const edgeCountEl = document.getElementById('edgeCount');
   const centerBtn = document.getElementById('centerBtn');
   const connectBtn = document.getElementById('connectBtn');
+  const levelNavDeeper = document.getElementById('levelNavDeeper');
+  const levelNavShallower = document.getElementById('levelNavShallower');
   const tabBar = document.getElementById('graph-tab-bar');
   const nodeInfoPopover = document.getElementById('nodeInfoPopover');
   const nodeInfoTitle = document.getElementById('nodeInfoTitle');
   const nodeInfoPath = document.getElementById('nodeInfoPath');
   const nodeInfoBody = document.getElementById('nodeInfoBody');
   const nodeInfoClose = document.getElementById('nodeInfoClose');
-  const nodeInfoBacktrack = document.getElementById('nodeInfoBacktrack');
+  const nodeInfoNext = document.getElementById('nodeInfoNext');
 
   /** @type {Map<string, { graphSnapshots: object, routeNames: string[], initialRouteId?: string }>} */
   const sessions = new Map();
@@ -52,6 +54,15 @@
   let bfsNavAnchorNodeId = null;
   let bfsNavCurrentLevel = null;
   let bfsNavIsActive = false;
+  /** While true, ignore selectNode/deselectNode handlers (programmatic selection from marquee). */
+  let suppressSelectionStyleEvents = false;
+  /**
+   * Active marquee: client coords + pointer id + selection snapshot for Shift-extend.
+   * Pointer x/y for DOMtoCanvas are relative to the vis canvas (see vis getPointer).
+   */
+  let marqueeState = null;
+  /** Before the drag exceeds the slop threshold, hold intent here so click-to-deselect still reaches vis. */
+  let marqueePending = null;
 
   function clearLayerRevealTimers() {
     layerRevealTimers.forEach((id) => clearTimeout(id));
@@ -120,6 +131,72 @@
     return snap || null;
   }
 
+  function flushCurrentRoutePositionsToSession(sessionKey) {
+    if (!sessionKey || !network || !nodes) return;
+    const route = currentRouteId;
+    if (!route) return;
+    const ent = sessions.get(sessionKey);
+    if (!ent || !ent.graphSnapshots || !ent.graphSnapshots[route]) return;
+    const snap = ent.graphSnapshots[route];
+    if (!Array.isArray(snap.nodes)) return;
+    const allIds = snap.nodes.map((n) => n.id).filter(Boolean);
+    if (!allIds.length) return;
+    let pos = {};
+    try {
+      pos = network.getPositions(allIds);
+    } catch (e) {
+      pos = {};
+    }
+    const nextNodes = snap.nodes.map((n) => {
+      let p = pos[n.id];
+      if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+        try {
+          const ds = nodes.get(n.id);
+          if (ds && Number.isFinite(ds.x) && Number.isFinite(ds.y)) {
+            p = { x: ds.x, y: ds.y };
+          }
+        } catch (e2) {
+          /* ignore */
+        }
+      }
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+        return { ...n, x: p.x, y: p.y };
+      }
+      if (Number.isFinite(n.x) && Number.isFinite(n.y)) return n;
+      return n;
+    });
+    ent.graphSnapshots[route] = { ...snap, nodes: nextNodes };
+    if (sessionKey === activeSessionKey) {
+      graphSnapshots = ent.graphSnapshots;
+    }
+  }
+
+  function cloneSnapshotsForSave(ent) {
+    return JSON.parse(JSON.stringify(ent.graphSnapshots || {}));
+  }
+
+  function postSaveSessionForKey(sessionKey, saveToSaved) {
+    if (!sessionKey) return;
+    if (sessionKey === activeSessionKey) {
+      flushCurrentRoutePositionsToSession(activeSessionKey);
+      try {
+        if (network && typeof network.stopSimulation === 'function') {
+          network.stopSimulation();
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    const ent = sessions.get(sessionKey);
+    if (!ent) return;
+    vscode.postMessage({
+      type: 'cmd:saveSession',
+      sourceJsonPath: sessionKey,
+      saveToSaved: !!saveToSaved,
+      graphSnapshots: cloneSnapshotsForSave(ent),
+    });
+  }
+
   function normalizeNodePath(p) {
     return String(p || '').replace(/\\/g, '/').replace(/^\.?\//, '').trim().toLowerCase();
   }
@@ -127,12 +204,21 @@
   /** Must match initNetwork — reapplied after physics toggles so pan/zoom stay enabled. */
   const NETWORK_INTERACTION = {
     hover: true,
+    hoverConnectedEdges: false,
     selectConnectedEdges: false,
     tooltipDelay: 0,
     dragNodes: true,
-    dragView: true,
+    /** Off so Shift+rectangle select is not eaten by pan; pan with two-finger scroll on the graph. */
+    dragView: false,
     zoomView: false,
     multiselect: true,
+  };
+
+  /** Reused on every setOptions so arrows are not dropped and edges never react to direct hover. */
+  const EDGE_DISPLAY_DEFAULTS = {
+    arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+    hoverWidth: 0,
+    chosen: false,
   };
 
   function syncNetworkSize() {
@@ -142,7 +228,10 @@
     if (w <= 0 || h <= 0) return;
     try {
       network.setSize(`${w}px`, `${h}px`);
-      network.setOptions({ interaction: NETWORK_INTERACTION });
+      network.setOptions({
+        interaction: NETWORK_INTERACTION,
+        edges: EDGE_DISPLAY_DEFAULTS,
+      });
       network.redraw();
     } catch (e) {
       /* ignore */
@@ -164,6 +253,14 @@
     return short.length > 30 ? `${short.slice(0, 27)}…` : short;
   }
 
+  function markGraphSessionDirty(sessionKey) {
+    if (!sessionKey) return;
+    const ent = sessions.get(sessionKey);
+    if (!ent) return;
+    ent.unsavedChanges = true;
+    renderTabBar();
+  }
+
   function renderTabBar() {
     if (!tabBar) return;
     tabBar.innerHTML = '';
@@ -176,10 +273,10 @@
       tab.className = tabCls;
       tab.setAttribute('role', 'tab');
       tab.setAttribute('aria-selected', key === activeSessionKey ? 'true' : 'false');
-      if (s && s.backtrackDirty) {
+      if (s && (s.backtrackDirty || s.unsavedChanges)) {
         const dirtyDot = document.createElement('span');
         dirtyDot.className = 'graph-tab-dirty';
-        dirtyDot.title = 'Not saved — press Ctrl+S or click tab to save';
+        dirtyDot.title = 'Unsaved changes — press Ctrl+S (or double-click tab for a new copy in Saved)';
         tab.appendChild(dirtyDot);
       }
       const label = document.createElement('span');
@@ -218,13 +315,17 @@
       tab.addEventListener('click', (e) => {
         e.stopPropagation();
         if (activeSessionKey === key) return;
+        if (activeSessionKey) {
+          flushCurrentRoutePositionsToSession(activeSessionKey);
+        }
+        currentRouteId = null;
         activeSessionKey = key;
         renderTabBar();
         applyActiveSession();
       });
       tab.addEventListener('dblclick', (e) => {
         e.stopPropagation();
-        vscode.postMessage({ type: 'cmd:saveSession', sourceJsonPath: key, saveToSaved: true });
+        postSaveSessionForKey(key, true);
       });
       tabBar.appendChild(tab);
     });
@@ -250,6 +351,12 @@
 
   function handleUpsertSession(message) {
     const { sourceJsonPath, graphSnapshots: gs, routeNames: rn, initialRouteId: ir } = message;
+    if (activeSessionKey && activeSessionKey !== sourceJsonPath) {
+      flushCurrentRoutePositionsToSession(activeSessionKey);
+      currentRouteId = null;
+    } else if (activeSessionKey === sourceJsonPath && message.sessionMode !== 'replace') {
+      flushCurrentRoutePositionsToSession(activeSessionKey);
+    }
     const prev = sessions.get(sourceJsonPath);
     sessions.set(sourceJsonPath, {
       graphSnapshots: gs || {},
@@ -258,6 +365,8 @@
       isBacktrackSession:
         message.isBacktrackSession !== undefined ? !!message.isBacktrackSession : !!prev?.isBacktrackSession,
       backtrackDirty: message.backtrackDirty !== undefined ? !!message.backtrackDirty : !!prev?.backtrackDirty,
+      unsavedChanges:
+        message.unsavedChanges !== undefined ? !!message.unsavedChanges : !!(prev && prev.unsavedChanges),
       displayLabel: message.displayLabel !== undefined ? message.displayLabel : prev?.displayLabel,
       progressiveReveal:
         message.progressiveReveal !== undefined ? !!message.progressiveReveal : !!prev?.progressiveReveal,
@@ -265,7 +374,237 @@
     if (!sessionOrder.includes(sourceJsonPath)) sessionOrder.push(sourceJsonPath);
     activeSessionKey = sourceJsonPath;
     renderTabBar();
+
+    const gMap = gs || {};
+    const rNames = rn || [];
+    const sess = sessions.get(activeSessionKey);
+    if (sess) {
+      graphSnapshots = sess.graphSnapshots || {};
+      routeNames = sess.routeNames || [];
+    }
+
+    const targetRoute =
+      ir && gMap[ir] ? ir : rNames.find((r) => gMap[r]) || (rNames[0] && gMap[rNames[0]] ? rNames[0] : null);
+    const canMergeInPlace =
+      message.mergeInPlace &&
+      message.sessionMode === 'replace' &&
+      activeSessionKey === sourceJsonPath &&
+      network &&
+      nodes &&
+      edges &&
+      currentRouteId &&
+      targetRoute === currentRouteId &&
+      !!gMap[currentRouteId];
+
+    if (canMergeInPlace && mergeSnapshotIntoCurrentRoute(gMap, currentRouteId)) {
+      return;
+    }
+
     applyActiveSession();
+  }
+
+  /**
+   * Left-drag on empty canvas: rectangle selection. If something is already selected (from a prior click),
+   * the box unions with that selection (“click then extend”). With nothing selected, the box replaces selection.
+   * Slop before capture keeps click-on-empty deselect working. Live preview updates while dragging.
+   */
+  function setupMarqueeSelection() {
+    if (!container || !network || container.__marqueeBound) return;
+    container.__marqueeBound = true;
+
+    function visCanvas() {
+      return container.querySelector('.vis-network canvas');
+    }
+
+    function pointerRelativeToVisCanvas(e) {
+      const canvas = visCanvas();
+      if (!canvas) return null;
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+
+    function nodesInCanvasRect(x0, y0, x1, y1) {
+      const pad = 38;
+      const L = Math.min(x0, x1) - pad;
+      const R = Math.max(x0, x1) + pad;
+      const T = Math.min(y0, y1) - pad;
+      const B = Math.max(y0, y1) + pad;
+      const ids = nodes.getIds();
+      const pos = network.getPositions(ids);
+      const out = [];
+      for (const id of ids) {
+        const p = pos[id];
+        if (!p) continue;
+        if (p.x >= L && p.x <= R && p.y >= T && p.y <= B) out.push(id);
+      }
+      return out;
+    }
+
+    function rectPickForMarquee(st) {
+      const canvas = visCanvas();
+      if (!canvas || !network) return [];
+      const r = canvas.getBoundingClientRect();
+      const ptr0 = { x: st.clientX0 - r.left, y: st.clientY0 - r.top };
+      const ptr1 = { x: st.clientX1 - r.left, y: st.clientY1 - r.top };
+      const c0 = network.DOMtoCanvas(ptr0);
+      const c1 = network.DOMtoCanvas(ptr1);
+      return nodesInCanvasRect(c0.x, c0.y, c1.x, c1.y);
+    }
+
+    function selectionIdsForMarquee(st, picked) {
+      if (st.additive) {
+        return [...new Set([...(st.selectionAtStart || []), ...picked])];
+      }
+      return picked;
+    }
+
+    function applyMarqueePreview(st) {
+      const picked = rectPickForMarquee(st);
+      const next = selectionIdsForMarquee(st, picked);
+      suppressSelectionStyleEvents = true;
+      try {
+        network.selectNodes(next);
+      } finally {
+        suppressSelectionStyleEvents = false;
+      }
+      applySelectionHighlightForCount(network.getSelectedNodes() || []);
+    }
+
+    network.on('afterDrawing', (ctx) => {
+      if (!marqueeState || !network) return;
+      const canvas = visCanvas();
+      if (!canvas) return;
+      const r = canvas.getBoundingClientRect();
+      const p0 = {
+        x: marqueeState.clientX0 - r.left,
+        y: marqueeState.clientY0 - r.top,
+      };
+      const p1 = {
+        x: marqueeState.clientX1 - r.left,
+        y: marqueeState.clientY1 - r.top,
+      };
+      const w0 = network.DOMtoCanvas(p0);
+      const w1 = network.DOMtoCanvas(p1);
+      const xMin = Math.min(w0.x, w1.x);
+      const xMax = Math.max(w0.x, w1.x);
+      const yMin = Math.min(w0.y, w1.y);
+      const yMax = Math.max(w0.y, w1.y);
+      const scale = Math.max(0.01, network.getScale() || 1);
+      ctx.save();
+      ctx.fillStyle = 'rgba(88, 166, 255, 0.14)';
+      ctx.strokeStyle = 'rgba(88, 166, 255, 0.9)';
+      ctx.setLineDash([6 / scale, 4 / scale]);
+      ctx.lineWidth = 2 / scale;
+      ctx.fillRect(xMin, yMin, xMax - xMin, yMax - yMin);
+      ctx.strokeRect(xMin, yMin, xMax - xMin, yMax - yMin);
+      ctx.restore();
+    });
+
+    function onMarqueePointerDown(e) {
+      if (!network || !nodes) return;
+      if (e.button !== 0) return;
+      if (isTextInputElement(document.activeElement)) return;
+      if (connectMode) return;
+      const wrap = container.getBoundingClientRect();
+      if (
+        e.clientX < wrap.left ||
+        e.clientY < wrap.top ||
+        e.clientX > wrap.right ||
+        e.clientY > wrap.bottom
+      ) {
+        return;
+      }
+      const ptr = pointerRelativeToVisCanvas(e);
+      if (!ptr) return;
+      if (network.getNodeAt(ptr) !== undefined) return;
+      marqueePending = {
+        pointerId: e.pointerId,
+        clientX0: e.clientX,
+        clientY0: e.clientY,
+      };
+    }
+
+    function onMarqueePointerMove(e) {
+      if (marqueePending && marqueePending.pointerId === e.pointerId) {
+        const dx = e.clientX - marqueePending.clientX0;
+        const dy = e.clientY - marqueePending.clientY0;
+        if (Math.hypot(dx, dy) < 6) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const startSel = network.getSelectedNodes() || [];
+        marqueeState = {
+          clientX0: marqueePending.clientX0,
+          clientY0: marqueePending.clientY0,
+          clientX1: e.clientX,
+          clientY1: e.clientY,
+          pointerId: marqueePending.pointerId,
+          additive: startSel.length > 0,
+          selectionAtStart: startSel.slice(),
+        };
+        marqueePending = null;
+        try {
+          network.setOptions({ interaction: { ...NETWORK_INTERACTION, dragView: false } });
+        } catch (_err) {
+          /* ignore */
+        }
+        try {
+          container.setPointerCapture(e.pointerId);
+        } catch (_cap) {
+          /* ignore */
+        }
+        applyMarqueePreview(marqueeState);
+        try {
+          network.redraw();
+        } catch (_r) {
+          /* ignore */
+        }
+        return;
+      }
+      if (!marqueeState || e.pointerId !== marqueeState.pointerId) return;
+      marqueeState.clientX1 = e.clientX;
+      marqueeState.clientY1 = e.clientY;
+      applyMarqueePreview(marqueeState);
+      try {
+        network.redraw();
+      } catch (_r) {
+        /* ignore */
+      }
+    }
+
+    function finishMarquee(e) {
+      if (marqueePending && marqueePending.pointerId === e.pointerId) {
+        marqueePending = null;
+        return;
+      }
+      if (!marqueeState || e.pointerId !== marqueeState.pointerId) return;
+      try {
+        container.releasePointerCapture(e.pointerId);
+      } catch (_rel) {
+        /* ignore */
+      }
+      const st = marqueeState;
+      marqueeState = null;
+      try {
+        network.redraw();
+      } catch (_r) {
+        /* ignore */
+      }
+      try {
+        network.setOptions({ interaction: NETWORK_INTERACTION });
+      } catch (_opt) {
+        /* ignore */
+      }
+      const dx = st.clientX1 - st.clientX0;
+      const dy = st.clientY1 - st.clientY0;
+      if (Math.hypot(dx, dy) < 6) return;
+
+      applyMarqueePreview(st);
+    }
+
+    container.addEventListener('pointerdown', onMarqueePointerDown, true);
+    window.addEventListener('pointermove', onMarqueePointerMove, true);
+    window.addEventListener('pointerup', finishMarquee, true);
+    window.addEventListener('pointercancel', finishMarquee, true);
   }
 
   function initNetwork() {
@@ -284,7 +623,7 @@
         },
         stabilization: { enabled: true, iterations: 400, fit: true },
       },
-      edges: { arrows: { to: { enabled: true, scaleFactor: 0.5 } } },
+      edges: EDGE_DISPLAY_DEFAULTS,
       interaction: NETWORK_INTERACTION,
     });
 
@@ -323,6 +662,7 @@
       updateConnectBtn();
     }
     network.on('selectNode', () => {
+      if (suppressSelectionStyleEvents) return;
       const selectedIds = network.getSelectedNodes();
       if (!selectedIds || selectedIds.length === 0) return;
       const selectedId = selectedIds[0];
@@ -355,30 +695,39 @@
           connectBtn.classList.remove('active');
         }
       }
-      highlightAround(selectedIds);
+      applySelectionHighlightForCount(selectedIds);
     });
 
     network.on('deselectNode', () => {
-      bfsNavAnchorNodeId = null;
-      bfsNavCurrentLevel = null;
+      if (suppressSelectionStyleEvents) return;
+      const remaining = network.getSelectedNodes() || [];
+      if (remaining.length === 0) {
+        bfsNavAnchorNodeId = null;
+        bfsNavCurrentLevel = null;
+        bfsNavIsActive = false;
+        restoreStyles();
+        return;
+      }
+      bfsNavAnchorNodeId = remaining[0];
+      bfsNavCurrentLevel = getNodeImportLevel(remaining[0]);
       bfsNavIsActive = false;
-      restoreStyles();
+      applySelectionHighlightForCount(remaining);
     });
     network.on('hoverNode', (params) => {
       if (!params || !params.node) return;
+      const sel = network.getSelectedNodes() || [];
+      if (sel.length > 1) return;
       highlightEdgesForNodes(new Set([params.node]));
     });
     network.on('blurNode', () => {
       applyCurrentHighlightMode();
     });
-    network.on('hoverEdge', (params) => {
-      if (!params || !params.edge) return;
-      highlightSingleEdge(params.edge);
+    network.on('dragEnd', () => {
+      if (activeSessionKey && currentRouteId) {
+        flushCurrentRoutePositionsToSession(activeSessionKey);
+        markGraphSessionDirty(activeSessionKey);
+      }
     });
-    network.on('blurEdge', () => {
-      applyCurrentHighlightMode();
-    });
-
     network.on('doubleClick', (params) => {
       if (!params.nodes || params.nodes.length === 0) return;
       hideNodeInfoPopover();
@@ -472,7 +821,7 @@
       scheduleZoomReadableSizing(targetScale);
     }
 
-    /** Right-click / two-finger click (Mac trackpad) opens node details + backtrack. */
+    /** Right-click / two-finger click (Mac trackpad) opens node details + Next (workspace importers). */
     function onGraphContextMenu(e) {
       if (!network || !container) return;
       const data = getCanvasRelativePointerForContextMenu(e);
@@ -520,35 +869,24 @@
       let dropX;
       let dropY;
       if (network && container) {
-        const rect = container.getBoundingClientRect();
-        const dom = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-        const canvas = network.DOMtoCanvas(dom);
-        dropX = canvas.x;
-        dropY = canvas.y;
+        const canvasEl = container.querySelector('.vis-network canvas');
+        if (canvasEl) {
+          const r = canvasEl.getBoundingClientRect();
+          const ptr = { x: e.clientX - r.left, y: e.clientY - r.top };
+          const c = network.DOMtoCanvas(ptr);
+          dropX = c.x;
+          dropY = c.y;
+        }
       }
       const deduped = extractDroppedPaths(e.dataTransfer);
-      if (deduped.length === 0) {
-        vscode.postMessage({
-          type: 'cmd:addRecentTreeDrag',
-          routeId: currentRouteId,
-          sourceJsonPath: activeSessionKey,
-          dropX,
-          dropY,
-        });
-        return;
-      }
-      let i = 0;
-      for (const droppedPath of deduped) {
-        vscode.postMessage({
-          type: 'cmd:addNodeFromDrop',
-          droppedPath,
-          routeId: currentRouteId,
-          sourceJsonPath: activeSessionKey,
-          dropX: typeof dropX === 'number' ? dropX + i * 36 : undefined,
-          dropY: typeof dropY === 'number' ? dropY + i * 20 : undefined,
-        });
-        i += 1;
-      }
+      vscode.postMessage({
+        type: 'cmd:graphDrop',
+        routeId: currentRouteId,
+        sourceJsonPath: activeSessionKey,
+        pathsFromDataTransfer: deduped,
+        dropX,
+        dropY,
+      });
     }
 
     function showDropOverlay() {
@@ -616,8 +954,8 @@
         hideNodeInfoPopover();
       });
     }
-    if (nodeInfoBacktrack) {
-      nodeInfoBacktrack.addEventListener('click', (e) => {
+    if (nodeInfoNext) {
+      nodeInfoNext.addEventListener('click', (e) => {
         e.stopPropagation();
         if (!lastInfoNodeId) return;
         vscode.postMessage({
@@ -628,6 +966,20 @@
         });
       });
     }
+    if (levelNavDeeper) {
+      levelNavDeeper.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        highlightAdjacentImportLevel(1);
+      });
+    }
+    if (levelNavShallower) {
+      levelNavShallower.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        highlightAdjacentImportLevel(-1);
+      });
+    }
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') hideNodeInfoPopover();
     });
@@ -636,7 +988,8 @@
       (e) => {
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
           if (isTextInputElement(document.activeElement)) return;
-          const direction = e.key === 'ArrowDown' ? 1 : -1;
+          // Match upward layout: Up = deeper imports, Down = shallower.
+          const direction = e.key === 'ArrowDown' ? -1 : 1;
           if (highlightAdjacentImportLevel(direction)) {
             e.preventDefault();
             e.stopPropagation();
@@ -644,15 +997,16 @@
           }
         }
         if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
-          const s = activeSessionKey && sessions.get(activeSessionKey);
-          if (s && s.backtrackDirty) {
+          if (activeSessionKey && sessions.get(activeSessionKey)) {
             e.preventDefault();
-            vscode.postMessage({ type: 'cmd:saveSession', sourceJsonPath: activeSessionKey });
+            postSaveSessionForKey(activeSessionKey, false);
           }
         }
       },
       true
     );
+
+    setupMarqueeSelection();
   }
 
   function getCanvasRelativePointerForContextMenu(e) {
@@ -751,6 +1105,53 @@
       width: 1.5,
     }));
     edges.update(edgeRestore);
+  }
+
+  /** Multi-select (e.g. rectangle): accent selected nodes only; do not dim neighbors or highlight edges. */
+  function highlightMultiSelection(selectedIds) {
+    if (!nodes || !edges) return;
+    const set = new Set(selectedIds);
+    nodes.update(
+      nodes.getIds().map((id) => {
+        const n = nodes.get(id);
+        const o = originals[id] || {};
+        const c = n?.color && typeof n.color === 'object' ? n.color : {};
+        const base = { id, label: n?.label ?? id };
+        if (set.has(id)) {
+          return {
+            ...base,
+            opacity: 1,
+            color: { ...c, border: '#58a6ff' },
+            borderWidth: 2.8,
+          };
+        }
+        return {
+          ...base,
+          opacity: 1,
+          color: { ...c, border: o.border || c.border || '#666' },
+          borderWidth: o.borderWidth ?? 1.5,
+        };
+      })
+    );
+    edges.update(
+      edges.getIds().map((eid) => ({
+        id: eid,
+        color: { color: 'rgba(255,255,255,0.15)', highlight: '#FFC107', hover: '#FFC107' },
+        width: 1.5,
+      }))
+    );
+  }
+
+  function applySelectionHighlightForCount(selectedIds) {
+    if (!selectedIds || selectedIds.length === 0) {
+      restoreStyles();
+      return;
+    }
+    if (selectedIds.length > 1) {
+      highlightMultiSelection(selectedIds);
+    } else {
+      highlightAround(selectedIds);
+    }
   }
 
   function isTextInputElement(el) {
@@ -881,6 +1282,10 @@
       restoreStyles();
       return;
     }
+    if (selectedIds.length > 1) {
+      highlightMultiSelection(selectedIds);
+      return;
+    }
     const selectedId = selectedIds[0];
     if (bfsNavIsActive && typeof bfsNavCurrentLevel === 'number') {
       renderBfsLevelHighlight(bfsNavCurrentLevel, selectedId);
@@ -890,6 +1295,8 @@
   }
 
   function highlightEdgesForNodes(nodeIdSet) {
+    const sel = network ? network.getSelectedNodes() || [] : [];
+    if (sel.length > 1) return;
     edges.update(
       edges.getIds().map((eid) => {
         const e = edges.get(eid);
@@ -912,36 +1319,6 @@
         }
         return { id: eid, color: { color: 'rgba(255,255,255,0.04)', highlight: '#FFC107', hover: '#FFC107' }, width: 1 };
       })
-    );
-  }
-
-  function highlightSingleEdge(edgeId) {
-    const hovered = edges.get(edgeId);
-    if (!hovered) return;
-    const endpointIds = new Set([hovered.from, hovered.to]);
-    nodes.update(
-      nodes.getIds().map((id) => {
-        const n = nodes.get(id);
-        const o = originals[id] || {};
-        const c = n?.color && typeof n.color === 'object' ? n.color : {};
-        const base = { id, label: n?.label ?? id };
-        if (endpointIds.has(id)) {
-          return { ...base, opacity: 1, color: { ...c, border: '#FFC107' }, borderWidth: 3 };
-        }
-        return {
-          ...base,
-          opacity: 0.28,
-          color: { ...c, border: o.border || c.border || '#666' },
-          borderWidth: o.borderWidth ?? 1.5,
-        };
-      })
-    );
-    edges.update(
-      edges.getIds().map((eid) =>
-        eid === edgeId
-          ? { id: eid, color: { color: '#FFC107', highlight: '#FFC107', hover: '#FFC107' }, width: 2.8 }
-          : { id: eid, color: { color: 'rgba(255,255,255,0.04)', highlight: '#FFC107', hover: '#FFC107' }, width: 1 }
-      )
     );
   }
 
@@ -1038,14 +1415,14 @@
   }
 
   /**
-   * Fixed top-to-bottom layout: level 0 = entry file, then direct imports, etc.
+   * Fixed bottom-to-top layout by import depth: deeper imports sit higher (smaller y).
    * Horizontal positions use cumulative widths so adjacent nodes never share the same space.
    * For same-level relations we offset node Y positions (not edge arcs).
    */
   function positionNodesForImportLevel(level, nodeList, rawEdges) {
     const count = nodeList.length;
     const vStep = 190;
-    const y = level * vStep;
+    const y = -level * vStep;
     if (count === 0) return [];
     const margin = 24;
     const widths = nodeList.map((n) => estimateLabelBoxWidth(n));
@@ -1083,6 +1460,7 @@
     network.setOptions({
       physics: { enabled: false },
       interaction: NETWORK_INTERACTION,
+      edges: EDGE_DISPLAY_DEFAULTS,
     });
     try {
       network.stopSimulation();
@@ -1097,19 +1475,27 @@
       byLevel.get(lv).push(n);
     }
     const sortedLevels = [...byLevel.keys()].sort((a, b) => a - b);
+    const entryFocusId =
+      sortedLevels.length > 0 ? ((byLevel.get(sortedLevels[0]) || [])[0] || {}).id : null;
     const totalNodes = (current.nodes || []).length;
     const totalEdges = (rawEdges || []).length;
     updateZoomBounds(totalNodes);
     let levelIndex = 0;
     const stepMs = 165;
 
-    const fitMaxZoom =
-      totalNodes > 1200 ? 0.15 :
-      totalNodes > 700 ? 0.18 :
-      totalNodes > 350 ? 0.22 :
-      totalNodes > 150 ? 0.28 :
-      totalNodes > 60 ? 0.38 :
-      0.5;
+    const focusEntry = (animated) => {
+      if (!entryFocusId || !network) return;
+      try {
+        network.focus(entryFocusId, {
+          scale: 1.12,
+          animation: animated
+            ? { duration: 380, easingFunction: 'easeInOutQuad' }
+            : false,
+        });
+      } catch (_e) {
+        /* ignore */
+      }
+    };
 
     const step = () => {
       if (levelIndex >= sortedLevels.length) {
@@ -1117,7 +1503,7 @@
         edgeCountEl.textContent = String(edges.length);
         const nodeIds = (current.nodes || []).map((n) => n.id).sort((a, b) => a.localeCompare(b));
         vscode.postMessage({ type: 'graphMetaReady', routeNames, nodeIds, currentRouteId: routeId });
-        network.fit({ animation: { duration: 380, easingFunction: 'easeInOutQuad' }, maxZoomLevel: fitMaxZoom });
+        requestAnimationFrame(() => focusEntry(true));
         if (loadingOverlay) loadingOverlay.classList.remove('visible');
         syncNetworkSize();
         return;
@@ -1130,7 +1516,9 @@
       if (loadingOverlay && levelIndex === 0) loadingOverlay.classList.remove('visible');
       nodeCountEl.textContent = String(nodes.length);
       edgeCountEl.textContent = String(edges.length);
-      network.fit({ animation: { duration: 220, easingFunction: 'easeInOutQuad' }, maxZoomLevel: fitMaxZoom });
+      if (levelIndex === 0) {
+        requestAnimationFrame(() => focusEntry(false));
+      }
       levelIndex += 1;
       const tid = setTimeout(step, stepMs);
       layerRevealTimers.push(tid);
@@ -1140,6 +1528,9 @@
   }
 
   function loadGraph(routeId) {
+    if (activeSessionKey && currentRouteId && currentRouteId !== routeId) {
+      flushCurrentRoutePositionsToSession(activeSessionKey);
+    }
     const activeSession = activeSessionKey ? sessions.get(activeSessionKey) : null;
     const snap = graphSnapshots[routeId];
     if (!snap) {
@@ -1154,7 +1545,7 @@
       /* ignore */
     }
     network.setOptions({ physics: { enabled: true } });
-    network.setOptions({ interaction: NETWORK_INTERACTION });
+    network.setOptions({ interaction: NETWORK_INTERACTION, edges: EDGE_DISPLAY_DEFAULTS });
     nodes.clear();
     edges.clear();
 
@@ -1200,6 +1591,56 @@
     updateZoomBounds(totalNodes);
     const hasImportLevels = (current.nodes || []).some((n) => typeof n.importLevel === 'number');
     const shouldProgressiveReveal = !!(activeSession && activeSession.progressiveReveal);
+    /** Use saved canvas coordinates whenever every node has x/y (not only when fixedLayout flag is set). */
+    const coordsComplete =
+      totalNodes > 0 &&
+      (current.nodes || []).every((n) => Number.isFinite(n.x) && Number.isFinite(n.y));
+    const useFixedLayout = coordsComplete;
+
+    if (useFixedLayout) {
+      network.setOptions({
+        physics: { enabled: false },
+        interaction: NETWORK_INTERACTION,
+        edges: EDGE_DISPLAY_DEFAULTS,
+      });
+      try {
+        network.stopSimulation();
+      } catch (e) {
+        /* ignore */
+      }
+      /* Saved x/y are only initial placement — do not set fixed:true or nodes cannot be moved. */
+      nodes.add(nodesForVisRaw);
+      edges.add(edgesForVis);
+
+      nodeCountEl.textContent = String(totalNodes);
+      edgeCountEl.textContent = String((current.edges || []).length);
+      const nodeIds = (current.nodes || []).map((n) => n.id).sort((a, b) => a.localeCompare(b));
+      vscode.postMessage({ type: 'graphMetaReady', routeNames, nodeIds, currentRouteId: routeId });
+
+      const autoScaleFx = computeAutoNodeScale(totalNodes);
+      if (userNodeSizeScale === 1 && autoScaleFx !== 1) {
+        applyNodeSizeScale(autoScaleFx);
+      } else if (userNodeSizeScale !== 1) {
+        applyNodeSizeScale(userNodeSizeScale);
+      } else {
+        scheduleZoomReadableSizing(network ? network.getScale() : 1);
+      }
+
+      const fitMaxZoomFx =
+        totalNodes > 1200 ? 0.15 :
+        totalNodes > 700 ? 0.18 :
+        totalNodes > 350 ? 0.22 :
+        totalNodes > 150 ? 0.28 :
+        totalNodes > 60 ? 0.38 :
+        0.5;
+      network.fit({ animation: false, maxZoomLevel: fitMaxZoomFx });
+      if (loadingOverlay) loadingOverlay.classList.remove('visible');
+      syncNetworkSize();
+      if (activeSessionKey && currentRouteId) {
+        flushCurrentRoutePositionsToSession(activeSessionKey);
+      }
+      return;
+    }
 
     if (hasImportLevels && shouldProgressiveReveal && totalNodes > 0) {
       const autoScale = computeAutoNodeScale(totalNodes);
@@ -1265,6 +1706,7 @@
         },
         stabilization: { enabled: true, iterations: stabilizationIterations, fit: false },
       },
+      edges: EDGE_DISPLAY_DEFAULTS,
     });
 
     let done = false;
@@ -1272,10 +1714,13 @@
       if (done) return;
       done = true;
       network.setOptions({ physics: { enabled: false } });
-      network.setOptions({ interaction: NETWORK_INTERACTION });
+      network.setOptions({ interaction: NETWORK_INTERACTION, edges: EDGE_DISPLAY_DEFAULTS });
       network.fit({ animation: false, maxZoomLevel: fitMaxZoom });
       if (loadingOverlay) loadingOverlay.classList.remove('visible');
       syncNetworkSize();
+      if (activeSessionKey && currentRouteId) {
+        flushCurrentRoutePositionsToSession(activeSessionKey);
+      }
     };
 
     const finishAfterTimeout = () => {
@@ -1289,6 +1734,157 @@
     network.once('stabilized', finish);
     network.stabilize(stabilizationIterations);
     setTimeout(finishAfterTimeout, 4000);
+  }
+
+  /**
+   * Patch the live network from an updated route snapshot without loadGraph (keeps pan/zoom/selection).
+   * Returns false if the graph is not in a layered import state we can safely merge.
+   */
+  function mergeSnapshotIntoCurrentRoute(gs, routeId) {
+    if (!network || !nodes || !edges || currentRouteId !== routeId) return false;
+    const snap = gs[routeId];
+    if (!snap) return false;
+
+    clearLayerRevealTimers();
+
+    const stripped = stripEntryNodes(snap);
+    const snapNodes = stripped.nodes || [];
+    const snapEdges = stripped.edges || [];
+    if (snapNodes.length === 0) return false;
+
+    const hasImportLevels = snapNodes.some((n) => typeof n.importLevel === 'number');
+    if (!hasImportLevels) return false;
+
+    const rawEdges = snapEdges.map((e) => {
+      const { title: _t, ...rest } = e;
+      return rest;
+    });
+    const snapEdgeKeys = new Set(rawEdges.map((e) => `${e.from}->${e.to}`));
+    const targetIds = new Set(snapNodes.map((n) => n.id));
+
+    for (const id of [...nodes.getIds()]) {
+      if (!targetIds.has(id)) {
+        try {
+          nodes.remove(id);
+        } catch (_e) {
+          /* ignore */
+        }
+        delete originals[id];
+        delete baseNodeSizes[id];
+        delete nodeTitleById[id];
+        delete nodeImportLevelById[id];
+      }
+    }
+
+    const selectedBefore = network.getSelectedNodes ? network.getSelectedNodes() : [];
+
+    for (const n of snapNodes) {
+      nodeImportLevelById[n.id] = getImportLevel(n);
+      nodeTitleById[n.id] = typeof n.title === 'string' ? n.title : '';
+    }
+
+    const toAdd = [];
+    for (const n of snapNodes) {
+      if (nodes.get(n.id)) continue;
+      const { title: _omitTitle, ...rest } = n;
+      toAdd.push(rest);
+      const c = n.color;
+      originals[n.id] = {
+        border: (c && c.border) || (typeof c === 'string' ? c : '#666'),
+        borderWidth: n.borderWidth || 1.5,
+      };
+      const font = n.font && typeof n.font === 'object' ? n.font : {};
+      const normalizedBaseSize = Math.min(Math.max(n.size || 42, 42), 64);
+      const normalizedFontSize = Math.min(Math.max(font.size || 20, 18), 28);
+      baseNodeSizes[n.id] = { size: normalizedBaseSize, fontSize: normalizedFontSize };
+    }
+    if (toAdd.length) nodes.add(toAdd);
+
+    for (const n of snapNodes) {
+      const cur = nodes.get(n.id);
+      if (!cur) continue;
+      if (typeof n.importLevel === 'number' && cur.importLevel !== n.importLevel) {
+        nodes.update({ id: n.id, importLevel: n.importLevel });
+      }
+    }
+
+    const byLevel = new Map();
+    for (const n of snapNodes) {
+      const lv = getImportLevel(n);
+      if (!byLevel.has(lv)) byLevel.set(lv, []);
+      byLevel.get(lv).push(n);
+    }
+    for (const lv of [...byLevel.keys()].sort((a, b) => a - b)) {
+      const batch = byLevel.get(lv) || [];
+      const positioned = positionNodesForImportLevel(lv, batch, rawEdges);
+      for (const p of positioned) {
+        if (!nodes.get(p.id)) continue;
+        const src = batch.find((b) => b.id === p.id);
+        const il = src ? getImportLevel(src) : getImportLevel(p);
+        nodes.update({ id: p.id, x: p.x, y: p.y, importLevel: il });
+      }
+    }
+
+    try {
+      network.setOptions({
+        physics: { enabled: false },
+        interaction: NETWORK_INTERACTION,
+        edges: EDGE_DISPLAY_DEFAULTS,
+      });
+      network.stopSimulation();
+    } catch (_e) {
+      /* ignore */
+    }
+
+    for (const eid of [...edges.getIds()]) {
+      const e = edges.get(eid);
+      if (!e) continue;
+      const k = `${e.from}->${e.to}`;
+      if (!snapEdgeKeys.has(k)) {
+        try {
+          edges.remove(eid);
+        } catch (_e2) {
+          /* ignore */
+        }
+      }
+    }
+
+    for (const e of rawEdges) {
+      const k = `${e.from}->${e.to}`;
+      if (!nodes.get(e.from) || !nodes.get(e.to)) continue;
+      const existing = edges.get({
+        filter: (item) => item.from === e.from && item.to === e.to,
+      });
+      if (existing && existing.length > 0) continue;
+      const { title: _omitTitle, ...rest } = e;
+      edges.add({ id: k, ...rest });
+    }
+
+    if (nodeCountEl) nodeCountEl.textContent = String(nodes.length);
+    if (edgeCountEl) edgeCountEl.textContent = String(edges.length);
+    const nodeIds = snapNodes.map((n) => n.id).sort((a, b) => a.localeCompare(b));
+    vscode.postMessage({ type: 'graphMetaReady', routeNames, nodeIds, currentRouteId: routeId });
+
+    const keep = selectedBefore.filter((id) => nodes.get(id));
+    if (keep.length) {
+      try {
+        network.selectNodes(keep);
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+
+    try {
+      network.redraw();
+    } catch (_e) {
+      /* ignore */
+    }
+    syncNetworkSize();
+    applyCurrentHighlightMode();
+    if (activeSessionKey) {
+      markGraphSessionDirty(activeSessionKey);
+    }
+    return true;
   }
 
   function focusNodeInGraph(filePath, silent) {
@@ -1331,6 +1927,7 @@
         if (ent) {
           if (message.isBacktrackSession !== undefined) ent.isBacktrackSession = !!message.isBacktrackSession;
           if (message.backtrackDirty !== undefined) ent.backtrackDirty = !!message.backtrackDirty;
+          if (message.unsavedChanges !== undefined) ent.unsavedChanges = !!message.unsavedChanges;
           if (message.displayLabel !== undefined) ent.displayLabel = message.displayLabel;
           renderTabBar();
         }
@@ -1424,6 +2021,52 @@
       case 'cmd:nodeSizeScale':
         if (typeof message.scale === 'number') applyNodeSizeScale(message.scale);
         break;
+      case 'cmd:exportGraphSnapshot': {
+        const key = message.sourceJsonPath;
+        const token = message.replyToken;
+        if (!key || !token) break;
+        const ent = sessions.get(key);
+        if (!ent) {
+          vscode.postMessage({ type: 'graphSnapshotExport', replyToken: token, error: 'noSession' });
+          break;
+        }
+        if (activeSessionKey === key) {
+          flushCurrentRoutePositionsToSession(key);
+          try {
+            if (network && typeof network.stopSimulation === 'function') network.stopSimulation();
+          } catch (e) {
+            /* ignore */
+          }
+        }
+        vscode.postMessage({
+          type: 'graphSnapshotExport',
+          replyToken: token,
+          graphSnapshots: cloneSnapshotsForSave(ent),
+          routeNames: ent.routeNames || [],
+        });
+        break;
+      }
+      case 'cmd:activateSessionAndSave': {
+        const key = message.sourceJsonPath;
+        const saveToSaved = !!message.saveToSaved;
+        if (!key) break;
+        if (!sessions.has(key)) {
+          break;
+        }
+        if (activeSessionKey !== key) {
+          if (activeSessionKey) {
+            flushCurrentRoutePositionsToSession(activeSessionKey);
+          }
+          currentRouteId = null;
+          activeSessionKey = key;
+          renderTabBar();
+          applyActiveSession();
+        }
+        setTimeout(() => {
+          postSaveSessionForKey(key, saveToSaved);
+        }, 500);
+        break;
+      }
     }
   });
 

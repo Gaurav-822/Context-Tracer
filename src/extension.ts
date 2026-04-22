@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FileDropTreeProvider, relPathFromWorkspaceTreeId, scanSavedBacktrackedJson, toFileNamedBasename } from './fileDropTree';
-import type { GraphData } from './types';
+import type { GraphData, GraphSnapshot } from './types';
 import type { GraphPanelLoadMode, UpsertSessionMessage } from './graphPanel';
 import {
   SearchSidebarViewProvider,
@@ -69,11 +69,23 @@ function sessionJsonBasenameForSave(sourceJsonPath: string): string {
   return path.basename(sourceJsonPath);
 }
 let fileDropProvider: FileDropTreeProvider;
+let searchSidebarProvider: SearchSidebarViewProvider;
 let fileDropTreeView: vscode.TreeView<vscode.TreeItem> | undefined;
+/** Filled when Explorer Map sidebar starts dragging a file; graph webview often gets empty dataTransfer for internal drags. */
+let pendingSidebarDragPaths: string[] | null = null;
+let pendingSidebarDragAt = 0;
+const PENDING_SIDEBAR_DRAG_TTL_MS = 20_000;
 
 export function activate(context: vscode.ExtensionContext) {
   fileDropProvider = new FileDropTreeProvider(context);
-  const searchViewProvider = new SearchSidebarViewProvider(context.extensionUri, {
+  searchSidebarProvider = new SearchSidebarViewProvider(context.extensionUri, {
+    listSavedGraphsForSidebar: () => listSavedGraphs(),
+    onSaveSavedGraphCopyAs: (absPath) => saveSavedGraphCopyAsNewFile(absPath),
+    onSavedGraphSaveInPlace: (absPath) => handleSavedGraphSaveInPlace(context, absPath),
+    onSidebarDragPaths: (paths) => {
+      pendingSidebarDragPaths = paths.length ? [...paths] : null;
+      pendingSidebarDragAt = paths.length ? Date.now() : 0;
+    },
     onRequestPanelData: async (params) => ({
       useLlm: fileDropProvider.useLlm,
       saved: listSavedGraphs(),
@@ -100,7 +112,7 @@ export function activate(context: vscode.ExtensionContext) {
       await buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
     },
   });
-  context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchViewProvider));
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchSidebarProvider));
 
   const maybeViewVisibilityListener = fileDropTreeView
     ? fileDropTreeView.onDidChangeVisibility((e) => {
@@ -297,7 +309,7 @@ async function buildWorkspaceTree(params: {
   const rawQuery = String(params.query || '').trim();
   const mode = params.mode || 'files';
   const matchCase = !!params.matchCase;
-  const wholeWord = !!params.wholeWord;
+  const wholeWord = params.wholeWord !== undefined ? !!params.wholeWord : true;
   const useRegex = !!params.useRegex;
   const include = '**/*';
   const exclude = '**/{node_modules,.git,dist,build,out,coverage}/**';
@@ -395,6 +407,34 @@ async function buildWorkspaceTree(params: {
   };
   const isMatch = makeMatcher();
 
+  /** Split a filename into rough "words" (camelCase, non-alnum) for loose file search. */
+  function splitBasenameIntoMatchTokens(label: string): string[] {
+    const parts = String(label).split(/[^a-zA-Z0-9]+/).filter(Boolean);
+    const out: string[] = [];
+    for (const part of parts) {
+      const spaced = part
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2');
+      for (const t of spaced.split(/\s+/).filter(Boolean)) {
+        out.push(t);
+      }
+    }
+    return out.length > 0 ? out : [String(label)];
+  }
+
+  /** Non-regex, non-whole-word file filter: substring must fall on a word boundary inside a token (excludes app-in-mappings). */
+  function fileBasenameLooseMatch(label: string): boolean {
+    const q = matchCase ? rawQuery : rawQuery.toLowerCase();
+    if (!q) return true;
+    const tokens = splitBasenameIntoMatchTokens(label);
+    const re = new RegExp(`\\b${escapeRegex(rawQuery)}\\b`, matchCase ? '' : 'i');
+    return tokens.some((t) => {
+      const sub = matchCase ? t : t.toLowerCase();
+      if (!sub.includes(q)) return false;
+      return re.test(t);
+    });
+  }
+
   const keepNode = (node: SidebarTreeNode, forceKeepSubtree = false): SidebarTreeNode | null => {
     if (forceKeepSubtree) {
       return {
@@ -404,7 +444,11 @@ async function buildWorkspaceTree(params: {
     }
     const rel = String(node.relPath || '');
     const folderMatches = node.type === 'folder' && mode === 'folders' && isMatch(rel);
-    const fileMatches = node.type === 'file' && mode === 'files' && isMatch(rel);
+    // File mode: basename only. Loose (substring) search uses per-token boundaries so e.g. "App" does not match "…mappings".
+    const fileMatches =
+      node.type === 'file' &&
+      mode === 'files' &&
+      (useRegex || wholeWord ? isMatch(node.label) : fileBasenameLooseMatch(node.label));
     if (node.type === 'file') return fileMatches ? node : null;
     const keptChildren = (node.children || [])
       .map((c) => keepNode(c, mode === 'folders' && folderMatches))
@@ -415,7 +459,42 @@ async function buildWorkspaceTree(params: {
     return null;
   };
 
-  return rootNodes.map(keepNode).filter((n): n is SidebarTreeNode => !!n);
+  const kept = rootNodes.map((n) => keepNode(n, false)).filter((n): n is SidebarTreeNode => !!n);
+
+  function subtreeFileCount(n: SidebarTreeNode): number {
+    if (n.type === 'file') return 1;
+    return (n.children || []).reduce((a, c) => a + subtreeFileCount(c), 0);
+  }
+
+  function pruneFoldersWithNoFiles(n: SidebarTreeNode): SidebarTreeNode | null {
+    if (n.type === 'file') return n;
+    const kids = (n.children || []).map(pruneFoldersWithNoFiles).filter((c): c is SidebarTreeNode => !!c);
+    if (subtreeFileCount({ ...n, children: kids }) === 0) return null;
+    return { ...n, children: kids };
+  }
+
+  function decorateExpandPath(nodes: SidebarTreeNode[]): SidebarTreeNode[] {
+    const visit = (n: SidebarTreeNode): SidebarTreeNode => {
+      if (n.type === 'file') {
+        return { ...n, expandPath: false };
+      }
+      const kids = (n.children || []).map(visit);
+      const selfMatch = mode === 'folders' && isMatch(String(n.relPath || ''));
+      const expandPath =
+        selfMatch ||
+        (mode === 'files'
+          ? kids.some((k) => k.type === 'file' || !!k.expandPath)
+          : kids.some((k) => !!k.expandPath));
+      return { ...n, children: kids, expandPath };
+    };
+    return nodes.map(visit);
+  }
+
+  let filtered = kept;
+  if (mode === 'files') {
+    filtered = kept.map(pruneFoldersWithNoFiles).filter((n): n is SidebarTreeNode => !!n);
+  }
+  return decorateExpandPath(filtered);
 }
 
 function listSavedGraphs(): { label: string; absPath: string; relPath: string }[] {
@@ -426,6 +505,21 @@ function listSavedGraphs(): { label: string; absPath: string; relPath: string }[
     absPath,
     relPath: path.relative(root, absPath).replace(/\\/g, '/'),
   }));
+}
+
+/** Overwrite saved JSON from sidebar “Save” (Map View must have session or we open first). */
+async function handleSavedGraphSaveInPlace(context: vscode.ExtensionContext, absPath: string): Promise<void> {
+  if (!graphDataByJsonPath.has(absPath)) {
+    await loadAndShowFileGraph(context, absPath);
+    vscode.window.showInformationMessage(
+      'When the graph finishes loading, press Ctrl+S — or right‑click this graph again and choose Save.'
+    );
+    return;
+  }
+  const inst = getGraphPanel()?.instance;
+  if (inst) {
+    await inst.requestActivateAndSave(absPath, false);
+  }
 }
 
 async function presentLiveImportGraph(
@@ -639,7 +733,7 @@ async function openVisualizer(context: vscode.ExtensionContext): Promise<void> {
     await loadAndShowFileGraph(context, detected);
     return;
   }
-  vscode.window.showInformationMessage('No file graph found. Use "Build From File" to create one.');
+  vscode.window.showInformationMessage('No file graph found. Use Explorer Map to create one.');
 }
 
 async function pickFileAndBuildGraph(
@@ -879,11 +973,24 @@ function graphPanelHooks() {
     onAddRecentTreeDrag: (payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => {
       void addRecentTreeDraggedNodes(payload.routeId, payload.sourceJsonPath, payload.dropX, payload.dropY);
     },
+    onGraphDrop: (payload: {
+      routeId: string;
+      sourceJsonPath: string;
+      pathsFromDataTransfer: string[];
+      dropX?: number;
+      dropY?: number;
+    }) => {
+      void handleGraphDropFromWebview(payload);
+    },
     onConnectNodes: (payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => {
       void connectGraphNodes(payload.fromNodeId, payload.toNodeId, payload.routeId, payload.sourceJsonPath);
     },
-    onSaveSession: (payload: { sourceJsonPath: string; saveToSaved?: boolean }) => {
-      void saveSession(payload.sourceJsonPath, !!payload.saveToSaved);
+    onSaveSession: (payload: {
+      sourceJsonPath: string;
+      saveToSaved?: boolean;
+      graphSnapshots?: GraphData['graphSnapshots'];
+    }) => {
+      void saveSession(payload.sourceJsonPath, !!payload.saveToSaved, payload.graphSnapshots);
     },
   };
 }
@@ -973,7 +1080,7 @@ async function addNodeFromGraphDrop(
   }
   snap.nodes.push(node);
   graphDataByJsonPath.set(sourceJsonPath, graphData);
-  getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: true });
+  getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: true, unsavedChanges: true });
   getGraphPanel()?.instance?.postWebviewMessage({
     type: 'cmd:addNodeApplied',
     sourceJsonPath,
@@ -999,6 +1106,39 @@ async function addRecentTreeDraggedNodes(
   }
 }
 
+async function handleGraphDropFromWebview(payload: {
+  routeId: string;
+  sourceJsonPath: string;
+  pathsFromDataTransfer: string[];
+  dropX?: number;
+  dropY?: number;
+}): Promise<void> {
+  const fromDt = Array.isArray(payload.pathsFromDataTransfer)
+    ? payload.pathsFromDataTransfer.filter((p): p is string => typeof p === 'string' && !!String(p).trim())
+    : [];
+  let paths = [...new Set(fromDt.map((p) => String(p).trim()))];
+  const pendingFresh =
+    pendingSidebarDragPaths?.length &&
+    pendingSidebarDragAt > 0 &&
+    Date.now() - pendingSidebarDragAt < PENDING_SIDEBAR_DRAG_TTL_MS;
+  if (paths.length === 0 && pendingFresh) {
+    paths = [...new Set(pendingSidebarDragPaths!)];
+  }
+  pendingSidebarDragPaths = null;
+  pendingSidebarDragAt = 0;
+  if (paths.length === 0) {
+    await addRecentTreeDraggedNodes(payload.routeId, payload.sourceJsonPath, payload.dropX, payload.dropY);
+    return;
+  }
+  let i = 0;
+  for (const droppedPath of paths) {
+    const dx = typeof payload.dropX === 'number' ? payload.dropX + i * 36 : undefined;
+    const dy = typeof payload.dropY === 'number' ? payload.dropY + i * 20 : undefined;
+    await addNodeFromGraphDrop(droppedPath, payload.routeId, payload.sourceJsonPath, dx, dy);
+    i += 1;
+  }
+}
+
 async function connectGraphNodes(
   fromNodeId: string,
   toNodeId: string,
@@ -1016,21 +1156,22 @@ async function connectGraphNodes(
     vscode.window.showWarningMessage('Both nodes must exist in the current route.');
     return;
   }
-  const already = snap.edges.some((e) => e.from === fromNodeId && e.to === toNodeId);
+  // Graph edges use imported -> importer; pending edits still record (importer, imported) for applyPendingImports.
+  const already = snap.edges.some((e) => e.from === toNodeId && e.to === fromNodeId);
   if (!already) {
-    snap.edges.push(makeManualEdge(fromNodeId, toNodeId));
+    snap.edges.push(makeManualEdge(toNodeId, fromNodeId));
   }
   const pending = pendingImportEdgesByJsonPath.get(sourceJsonPath) ?? [];
   const existsPending = pending.some((e) => e.fromRelPath === fromNodeId && e.toRelPath === toNodeId);
   if (!existsPending) pending.push({ fromRelPath: fromNodeId, toRelPath: toNodeId });
   pendingImportEdgesByJsonPath.set(sourceJsonPath, pending);
   graphDataByJsonPath.set(sourceJsonPath, graphData);
-  getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: true });
+  getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: true, unsavedChanges: true });
   getGraphPanel()?.instance?.postWebviewMessage({
     type: 'cmd:addEdgeApplied',
     sourceJsonPath,
     routeId,
-    edge: makeManualEdge(fromNodeId, toNodeId),
+    edge: makeManualEdge(toNodeId, fromNodeId),
   });
 }
 
@@ -1091,11 +1232,126 @@ async function applyPendingImports(sourceJsonPath: string): Promise<number> {
   return changedFiles;
 }
 
-async function saveSession(sourceJsonPath: string, saveToSaved = false): Promise<void> {
+function applyFixedLayoutFlags(snapshots: GraphData['graphSnapshots']): void {
+  for (const rid of Object.keys(snapshots)) {
+    const snap = snapshots[rid];
+    if (!snap?.nodes?.length) continue;
+    const allFinite = snap.nodes.every(
+      (n) => typeof n.x === 'number' && typeof n.y === 'number' && Number.isFinite(n.x) && Number.isFinite(n.y)
+    );
+    if (allFinite) snap.fixedLayout = true;
+    else delete snap.fixedLayout;
+  }
+}
+
+function notifySavedGraphsChanged(): void {
+  fileDropProvider.refreshSavedGraphs();
+  searchSidebarProvider.postSavedListUpdate();
+}
+
+/** True if this session path is an on-disk JSON under that workspace folder's visualizer/backtracked. */
+function isSavedGraphWorkspacePath(absJsonPath: string, root: string): boolean {
+  if (parseLiveImportSessionKey(absJsonPath)) return false;
+  if (!absJsonPath.toLowerCase().endsWith('.json')) return false;
+  const wf = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absJsonPath));
+  const folderRoot = wf?.uri.fsPath ?? root;
+  const br = path.normalize(path.join(path.normalize(folderRoot), 'visualizer', 'backtracked'));
+  const normPath = path.normalize(absJsonPath);
+  return normPath === br || normPath.startsWith(br + path.sep);
+}
+
+async function saveSavedGraphCopyAsNewFile(sourceAbsPath: string): Promise<void> {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) {
+    vscode.window.showWarningMessage('Open a workspace to save a graph copy.');
+    return;
+  }
+  const base = path.basename(sourceAbsPath, '.json');
+  const defaultUri = vscode.Uri.file(path.join(root, 'visualizer', 'backtracked', `${base}_copy.json`));
+  const picked = await vscode.window.showSaveDialog({
+    defaultUri,
+    filters: { JSON: ['json'] },
+    title: 'Save graph copy as',
+    saveLabel: 'Save copy',
+  });
+  if (!picked?.fsPath) return;
+
+  const gdMem = graphDataByJsonPath.get(sourceAbsPath);
+  const GP = getGraphPanel()?.instance;
+  let graphData: GraphData;
+  if (gdMem && GP) {
+    const live = await GP.requestSnapshotExport(sourceAbsPath);
+    graphData = { ...gdMem };
+    if (live?.graphSnapshots && Object.keys(live.graphSnapshots).length > 0) {
+      graphData.graphSnapshots = live.graphSnapshots;
+      if (live.routeNames?.length) {
+        graphData.routeNames = live.routeNames;
+      }
+      applyFixedLayoutFlags(graphData.graphSnapshots);
+    }
+  } else {
+    try {
+      graphData = JSON.parse(fs.readFileSync(sourceAbsPath, 'utf-8')) as GraphData;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      vscode.window.showErrorMessage(`Could not read graph file: ${msg}`);
+      return;
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(picked.fsPath), { recursive: true });
+    fs.writeFileSync(picked.fsPath, JSON.stringify(graphData, null, 2), 'utf-8');
+    notifySavedGraphsChanged();
+    vscode.window.showInformationMessage(`Saved graph copy: ${path.relative(root, picked.fsPath)}`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Save failed: ${msg}`);
+  }
+}
+
+/** Copy graph JSON into visualizer/backtracked so it appears under Saved in the sidebar. */
+function writeGraphCopyToBacktrackedDir(
+  root: string,
+  sourceJsonPath: string,
+  graphData: GraphData
+): string | null {
+  const outDir = path.join(root, 'visualizer', 'backtracked');
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+  } catch {
+    return null;
+  }
+  const base = sessionJsonBasenameForSave(sourceJsonPath);
+  const prefixed = base.toLowerCase().startsWith('backtracked_') ? base : `backtracked_${base}`;
+  let outPath = path.join(outDir, prefixed);
+  if (fs.existsSync(outPath)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const ext = path.extname(prefixed);
+    const stem = prefixed.slice(0, prefixed.length - ext.length);
+    outPath = path.join(outDir, `${stem}_${stamp}${ext}`);
+  }
+  try {
+    fs.writeFileSync(outPath, JSON.stringify(graphData, null, 2), 'utf-8');
+    return outPath;
+  } catch {
+    return null;
+  }
+}
+
+async function saveSession(
+  sourceJsonPath: string,
+  saveToSaved = false,
+  graphSnapshotsFromWebview?: GraphData['graphSnapshots']
+): Promise<void> {
   const graphData = graphDataByJsonPath.get(sourceJsonPath);
   if (!graphData) {
     vscode.window.showWarningMessage('No graph session loaded.');
     return;
+  }
+  if (graphSnapshotsFromWebview) {
+    graphData.graphSnapshots = graphSnapshotsFromWebview;
+    applyFixedLayoutFlags(graphData.graphSnapshots);
   }
   const changedFiles = await applyPendingImports(sourceJsonPath);
   const root = getPreferredProjectRoot(sourceJsonPath);
@@ -1106,20 +1362,27 @@ async function saveSession(sourceJsonPath: string, saveToSaved = false): Promise
   if (saveToSaved || graphData.backtrack) {
     const outDir = path.join(root, 'visualizer', 'backtracked');
     fs.mkdirSync(outDir, { recursive: true });
-    const base = sessionJsonBasenameForSave(sourceJsonPath);
-    const prefixed = base.toLowerCase().startsWith('backtracked_') ? base : `backtracked_${base}`;
-    let outPath = path.join(outDir, prefixed);
-    if (saveToSaved && fs.existsSync(outPath)) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const ext = path.extname(prefixed);
-      const stem = prefixed.slice(0, prefixed.length - ext.length);
-      outPath = path.join(outDir, `${stem}_${stamp}${ext}`);
+    const saveInPlaceOpenedFile =
+      !saveToSaved && isSavedGraphWorkspacePath(sourceJsonPath, root);
+    let outPath: string;
+    if (saveInPlaceOpenedFile) {
+      outPath = path.normalize(sourceJsonPath);
+    } else {
+      const base = sessionJsonBasenameForSave(sourceJsonPath);
+      const prefixed = base.toLowerCase().startsWith('backtracked_') ? base : `backtracked_${base}`;
+      outPath = path.join(outDir, prefixed);
+      if (saveToSaved && fs.existsSync(outPath)) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const ext = path.extname(prefixed);
+        const stem = prefixed.slice(0, prefixed.length - ext.length);
+        outPath = path.join(outDir, `${stem}_${stamp}${ext}`);
+      }
     }
     try {
       fs.writeFileSync(outPath, JSON.stringify(graphData, null, 2), 'utf-8');
       graphDataByJsonPath.set(sourceJsonPath, graphData);
-      getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false });
-      fileDropProvider.refreshSavedGraphs();
+      getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false, unsavedChanges: false });
+      notifySavedGraphsChanged();
       if (changedFiles > 0) {
         vscode.window.showInformationMessage(
           `Saved to ${path.relative(root, outPath)} and wrote imports in ${changedFiles} file(s).`
@@ -1139,11 +1402,23 @@ async function saveSession(sourceJsonPath: string, saveToSaved = false): Promise
       : sourceJsonPath;
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
     fs.writeFileSync(outFile, JSON.stringify(graphData, null, 2), 'utf-8');
-    getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false });
+    let sidebarCopyPath: string | null = null;
+    if (graphSnapshotsFromWebview) {
+      const primaryInBacktracked = outFile.replace(/\\/g, '/').includes('/visualizer/backtracked/');
+      if (!primaryInBacktracked) {
+        sidebarCopyPath = writeGraphCopyToBacktrackedDir(root, sourceJsonPath, graphData);
+      }
+      notifySavedGraphsChanged();
+    }
+    getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false, unsavedChanges: false });
     fileDropProvider.refreshFromFilesNamed();
     if (changedFiles > 0) {
       vscode.window.showInformationMessage(
         `Saved graph and wrote import statements in ${changedFiles} file(s).`
+      );
+    } else if (sidebarCopyPath) {
+      vscode.window.showInformationMessage(
+        `Saved graph JSON: ${path.relative(root, outFile)}. Copy for Saved sidebar: ${path.relative(root, sidebarCopyPath)}.`
       );
     } else {
       vscode.window.showInformationMessage(`Saved graph JSON: ${path.relative(root, outFile)}`);
@@ -1154,14 +1429,25 @@ async function saveSession(sourceJsonPath: string, saveToSaved = false): Promise
   }
 }
 
+function getNodeImportLevelForNext(snap: GraphSnapshot, nodeId: string): number {
+  const n = snap.nodes.find((x) => x.id === nodeId);
+  if (n && typeof n.importLevel === 'number') return n.importLevel;
+  return 0;
+}
+
 async function runBacktrackFromWebview(
   nodeId: string,
   routeId: string,
   sourceJsonPath: string
 ): Promise<void> {
+  if (nodeId.includes('::')) {
+    vscode.window.showWarningMessage('Next is only available for file nodes, not controller methods.');
+    return;
+  }
+
   const root = getPreferredProjectRoot(sourceJsonPath);
   if (!root) {
-    vscode.window.showErrorMessage('No workspace root for backtrack.');
+    vscode.window.showErrorMessage('No workspace root for Next.');
     return;
   }
   let graphData = graphDataByJsonPath.get(sourceJsonPath);
@@ -1184,24 +1470,41 @@ async function runBacktrackFromWebview(
       ? routeId
       : graphData.routeNames.find((r) => graphData.graphSnapshots[r]) ?? graphData.routeNames[0];
   if (!routeKey || !graphData.graphSnapshots[routeKey]) {
-    vscode.window.showErrorMessage('No graph route available for backtrack.');
+    vscode.window.showErrorMessage('No graph route available.');
     return;
   }
 
-  const { computeImporterClosureFromOpenEditors } = await lazyBacktrackClosure();
-  const { closureRelPaths, edges } = computeImporterClosureFromOpenEditors(nodeId, root);
-  if (closureRelPaths.length <= 1) {
-    vscode.window.showInformationMessage(
-      'No open files import this node yet. Open files that import it, then run Backtrack again.'
-    );
-    return;
-  }
+  const snap = graphData.graphSnapshots[routeKey];
+  const seedLevel = getNodeImportLevelForNext(snap, nodeId);
+  const importerImportLevel = seedLevel - 1;
 
+  const { computeDirectImportersFromWorkspace } = await lazyBacktrackClosure();
   const { mergeBacktrackIntoRoute } = await lazyBacktrackMerge();
-  const { newNodesAdded } = mergeBacktrackIntoRoute(graphData, routeKey, closureRelPaths, edges);
-  if (newNodesAdded <= 0) {
+
+  const { closureRelPaths, edges } = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: 'Next: scanning workspace for files that import this module…',
+      cancellable: true,
+    },
+    async (_progress, token) => computeDirectImportersFromWorkspace(nodeId, root, token)
+  );
+
+  if (closureRelPaths.length <= 1) {
+    vscode.window.showInformationMessage('No workspace files import this module (local/path-alias imports only).');
+    return;
+  }
+
+  const { newNodesAdded, newEdgesAdded } = mergeBacktrackIntoRoute(
+    graphData,
+    routeKey,
+    closureRelPaths,
+    edges,
+    importerImportLevel
+  );
+  if (newNodesAdded <= 0 && newEdgesAdded <= 0) {
     vscode.window.showInformationMessage(
-      'Backtrack: every file in the closure is already in this graph — nothing new to add.'
+      'Next: every matching importer is already in this graph with edges — nothing new to add.'
     );
     return;
   }
@@ -1224,19 +1527,22 @@ async function runBacktrackFromWebview(
     sessionMode: 'replace',
     isBacktrackSession: true,
     backtrackDirty: true,
+    unsavedChanges: true,
     displayLabel,
+    mergeInPlace: true,
   };
   getGraphPanel()?.instance?.deliverUpsertExternal(msg);
 
-  vscode.window.showInformationMessage(
-    `Backtrack: added ${newNodesAdded} new file node(s). Save with Ctrl+S or the tab.`
-  );
+  const parts: string[] = [];
+  if (newNodesAdded > 0) parts.push(`added ${newNodesAdded} file node(s)`);
+  if (newEdgesAdded > 0) parts.push(`added ${newEdgesAdded} link(s)`);
+  vscode.window.showInformationMessage(`Next: ${parts.join(', ')}. Use ▲/▼ (or arrow keys) to highlight import levels, including the new layer. Save with Ctrl+S or the tab.`);
 }
 
 async function saveBacktrackGraph(sourceJsonPath: string): Promise<void> {
   const graphData = graphDataByJsonPath.get(sourceJsonPath);
   if (!graphData?.backtrack) {
-    vscode.window.showWarningMessage('Nothing to save — run Backtrack first.');
+    vscode.window.showWarningMessage('Nothing to save — run Next first.');
     return;
   }
   const root = getPreferredProjectRoot(sourceJsonPath);
@@ -1253,8 +1559,8 @@ async function saveBacktrackGraph(sourceJsonPath: string): Promise<void> {
     fs.writeFileSync(outPath, JSON.stringify(graphData, null, 2), 'utf-8');
     vscode.window.showInformationMessage(`Saved: ${path.relative(root, outPath)}`);
     graphDataByJsonPath.set(sourceJsonPath, graphData);
-    getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false });
-    fileDropProvider.refreshSavedGraphs();
+    getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, backtrackDirty: false, unsavedChanges: false });
+    notifySavedGraphsChanged();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     vscode.window.showErrorMessage(`Save failed: ${msg}`);
@@ -1263,7 +1569,7 @@ async function saveBacktrackGraph(sourceJsonPath: string): Promise<void> {
 
 async function promptSaveBacktrack(sourceJsonPath: string): Promise<void> {
   const choice = await vscode.window.showInformationMessage(
-    'Save backtracked graph JSON to visualizer/backtracked?',
+    'Save graph JSON (with Next importers) to visualizer/backtracked?',
     'Save',
     'Cancel'
   );

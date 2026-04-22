@@ -3,6 +3,13 @@ import { GraphData } from './types';
 
 export type GraphPanelLoadMode = 'newWindow' | 'refreshOpenOrOpen';
 
+/** Webview → extension when saving so node x/y from vis-network are persisted. */
+export type SaveSessionPayload = {
+  sourceJsonPath: string;
+  saveToSaved?: boolean;
+  graphSnapshots?: GraphData['graphSnapshots'];
+};
+
 /** Sent to webview to add/update a graph session (tabs live inside the single Map View panel). */
 export interface UpsertSessionMessage {
   type: 'upsertSession';
@@ -15,10 +22,17 @@ export interface UpsertSessionMessage {
   /** Explicit session flags (do not infer from filename). */
   isBacktrackSession?: boolean;
   backtrackDirty?: boolean;
+  /** Tab dirty dot for layout edits; cleared on save. */
+  unsavedChanges?: boolean;
   /** Optional tab label (e.g. "backtracked · file.json"). */
   displayLabel?: string;
   /** True = level-by-level reveal, false = load all at once. */
   progressiveReveal?: boolean;
+  /**
+   * With sessionMode `replace` on the already-active tab: patch the current route in the webview
+   * (add/remove nodes/edges to match JSON) without a full reload — preserves pan/zoom/selection.
+   */
+  mergeInPlace?: boolean;
 }
 
 export interface SessionStateMessage {
@@ -26,6 +40,8 @@ export interface SessionStateMessage {
   sourceJsonPath: string;
   isBacktrackSession?: boolean;
   backtrackDirty?: boolean;
+  /** True when layout or graph content changed since last save (yellow tab dot). */
+  unsavedChanges?: boolean;
   displayLabel?: string;
 }
 
@@ -56,11 +72,24 @@ export class GraphPanel {
   private onAddRecentTreeDrag:
     | ((payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void)
     | null = null;
+  private onGraphDrop:
+    | ((payload: {
+        routeId: string;
+        sourceJsonPath: string;
+        pathsFromDataTransfer: string[];
+        dropX?: number;
+        dropY?: number;
+      }) => void)
+    | null = null;
   private onConnectNodes:
     | ((payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void)
     | null = null;
-  private onSaveSession: ((payload: { sourceJsonPath: string; saveToSaved?: boolean }) => void) | null = null;
+  private onSaveSession: ((payload: SaveSessionPayload) => void) | null = null;
   private pendingUpsert: UpsertSessionMessage | null = null;
+  private readonly exportWaiters = new Map<
+    string,
+    { resolve: (v: { graphSnapshots: GraphData['graphSnapshots']; routeNames: string[] } | null) => void; timeout: ReturnType<typeof setTimeout> }
+  >();
 
   public static open(
     extensionUri: vscode.Uri,
@@ -82,8 +111,15 @@ export class GraphPanel {
         dropY?: number;
       }) => void;
       onAddRecentTreeDrag?: (payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void;
+      onGraphDrop?: (payload: {
+        routeId: string;
+        sourceJsonPath: string;
+        pathsFromDataTransfer: string[];
+        dropX?: number;
+        dropY?: number;
+      }) => void;
       onConnectNodes?: (payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void;
-      onSaveSession?: (payload: { sourceJsonPath: string; saveToSaved?: boolean }) => void;
+      onSaveSession?: (payload: SaveSessionPayload) => void;
       /** When loading JSON that was saved after backtrack, restore tab styling without inferring from filename. */
       initialSession?: {
         isBacktrackSession?: boolean;
@@ -106,6 +142,7 @@ export class GraphPanel {
       sessionMode,
       isBacktrackSession: ini?.isBacktrackSession ?? false,
       backtrackDirty: ini?.backtrackDirty ?? false,
+      unsavedChanges: false,
       progressiveReveal: ini?.progressiveReveal ?? false,
     };
     if (ini?.displayLabel !== undefined) {
@@ -120,6 +157,7 @@ export class GraphPanel {
       GraphPanel.instance.onSaveBacktrackPrompt = hooks?.onSaveBacktrackPrompt ?? null;
       GraphPanel.instance.onAddNodeFromDrop = hooks?.onAddNodeFromDrop ?? null;
       GraphPanel.instance.onAddRecentTreeDrag = hooks?.onAddRecentTreeDrag ?? null;
+      GraphPanel.instance.onGraphDrop = hooks?.onGraphDrop ?? null;
       GraphPanel.instance.onConnectNodes = hooks?.onConnectNodes ?? null;
       GraphPanel.instance.onSaveSession = hooks?.onSaveSession ?? null;
       GraphPanel.instance.deliverUpsert(msg);
@@ -156,6 +194,7 @@ export class GraphPanel {
       hooks?.onSaveBacktrackPrompt ?? null,
       hooks?.onAddNodeFromDrop ?? null,
       hooks?.onAddRecentTreeDrag ?? null,
+      hooks?.onGraphDrop ?? null,
       hooks?.onConnectNodes ?? null,
       hooks?.onSaveSession ?? null,
       msg
@@ -174,6 +213,7 @@ export class GraphPanel {
     onSaveBacktrackPrompt: GraphPanel['onSaveBacktrackPrompt'],
     onAddNodeFromDrop: GraphPanel['onAddNodeFromDrop'],
     onAddRecentTreeDrag: GraphPanel['onAddRecentTreeDrag'],
+    onGraphDrop: GraphPanel['onGraphDrop'],
     onConnectNodes: GraphPanel['onConnectNodes'],
     onSaveSession: GraphPanel['onSaveSession'],
     firstUpsert: UpsertSessionMessage
@@ -187,6 +227,7 @@ export class GraphPanel {
     this.onSaveBacktrackPrompt = onSaveBacktrackPrompt;
     this.onAddNodeFromDrop = onAddNodeFromDrop;
     this.onAddRecentTreeDrag = onAddRecentTreeDrag;
+    this.onGraphDrop = onGraphDrop;
     this.onConnectNodes = onConnectNodes;
     this.onSaveSession = onSaveSession;
     this.pendingUpsert = firstUpsert;
@@ -267,6 +308,22 @@ export class GraphPanel {
               });
             }
             break;
+          case 'cmd:graphDrop':
+            if (
+              this.onGraphDrop &&
+              typeof message.routeId === 'string' &&
+              typeof message.sourceJsonPath === 'string' &&
+              Array.isArray((message as { pathsFromDataTransfer?: unknown }).pathsFromDataTransfer)
+            ) {
+              this.onGraphDrop({
+                routeId: message.routeId,
+                sourceJsonPath: message.sourceJsonPath,
+                pathsFromDataTransfer: (message as { pathsFromDataTransfer: string[] }).pathsFromDataTransfer,
+                dropX: typeof message.dropX === 'number' ? message.dropX : undefined,
+                dropY: typeof message.dropY === 'number' ? message.dropY : undefined,
+              });
+            }
+            break;
           case 'cmd:connectNodes':
             if (
               this.onConnectNodes &&
@@ -285,9 +342,14 @@ export class GraphPanel {
             break;
           case 'cmd:saveSession':
             if (this.onSaveSession && typeof message.sourceJsonPath === 'string') {
+              const gs = (message as { graphSnapshots?: unknown }).graphSnapshots;
               this.onSaveSession({
                 sourceJsonPath: message.sourceJsonPath,
                 saveToSaved: !!message.saveToSaved,
+                graphSnapshots:
+                  gs && typeof gs === 'object' && !Array.isArray(gs)
+                    ? (gs as GraphData['graphSnapshots'])
+                    : undefined,
               });
             }
             break;
@@ -296,6 +358,28 @@ export class GraphPanel {
               `"${message.filePath}" is not in the current import graph. Rebuild the graph from that file if needed.`
             );
             break;
+          case 'graphSnapshotExport': {
+            const token = typeof message.replyToken === 'string' ? message.replyToken : '';
+            const w = token ? this.exportWaiters.get(token) : undefined;
+            if (w) {
+              clearTimeout(w.timeout);
+              this.exportWaiters.delete(token);
+              if (message.error === 'noSession') {
+                w.resolve(null);
+              } else {
+                const gs = (message as { graphSnapshots?: unknown }).graphSnapshots;
+                const rn = (message as { routeNames?: unknown }).routeNames;
+                w.resolve({
+                  graphSnapshots:
+                    gs && typeof gs === 'object' && !Array.isArray(gs)
+                      ? (gs as GraphData['graphSnapshots'])
+                      : {},
+                  routeNames: Array.isArray(rn) ? (rn as string[]) : [],
+                });
+              }
+            }
+            break;
+          }
         }
       },
       null,
@@ -333,6 +417,37 @@ export class GraphPanel {
     this.panel.webview.postMessage(message);
   }
 
+  /**
+   * Ask the webview for the latest graphSnapshots + routeNames for a session (flushes positions if that tab is active).
+   * Resolves null if the session is not loaded or the request times out.
+   */
+  public requestSnapshotExport(sourceJsonPath: string): Promise<{ graphSnapshots: GraphData['graphSnapshots']; routeNames: string[] } | null> {
+    return new Promise((resolve) => {
+      const token = `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+      const timeout = setTimeout(() => {
+        this.exportWaiters.delete(token);
+        resolve(null);
+      }, 10_000);
+      this.exportWaiters.set(token, { resolve, timeout });
+      void this.panel.webview.postMessage({
+        type: 'cmd:exportGraphSnapshot',
+        sourceJsonPath,
+        replyToken: token,
+      });
+    });
+  }
+
+  /** Focus Map View, switch to this session tab if needed, then run the same save as Ctrl+S / tab double-click. */
+  public async requestActivateAndSave(sourceJsonPath: string, saveToSaved: boolean): Promise<void> {
+    this.panel.reveal();
+    void this.panel.webview.postMessage({
+      type: 'cmd:activateSessionAndSave',
+      sourceJsonPath,
+      saveToSaved: !!saveToSaved,
+    });
+    await new Promise((r) => setTimeout(r, 750));
+  }
+
   private getHtmlForWebview(): string {
     const webview = this.panel.webview;
     const mediaUri = vscode.Uri.joinPath(this.extensionUri, 'media');
@@ -357,7 +472,7 @@ export class GraphPanel {
     <span>Loading file graph…</span>
   </div>
   <div id="graph-drop-overlay">
-    <div class="drop-hint">Drop files here to add nodes<br><small>From Explorer/Finder: hold Shift while dragging</small></div>
+    <div class="drop-hint">Drop files here to add nodes<br><small>From Explorer Map, Explorer, or Finder</small></div>
   </div>
 
   <div id="graph-app">
@@ -374,17 +489,21 @@ export class GraphPanel {
   <div id="stats">
     <span id="nodeCount">0</span> files &middot; <span id="edgeCount">0</span> connections
   </div>
-  <div id="dragHelp">Tip: hold Shift while dragging files into graph</div>
+  <div id="dragHelp">Pan: two-finger scroll on the graph. Drag on empty canvas: rectangle select (merges with any current click-selection; click empty first to replace). Drag files onto the graph to add nodes.</div>
 
   <button id="centerBtn" title="Center graph">⊙ Center</button>
   <button id="connectBtn" title="Connect one file to another">⇢ Connect imports</button>
+  <div id="levelNav" class="level-nav" role="toolbar" aria-label="Highlight by import depth">
+    <button type="button" id="levelNavDeeper" class="level-nav-btn" title="Deeper imports (same as ↑ key)">▲</button>
+    <button type="button" id="levelNavShallower" class="level-nav-btn" title="Shallower imports (same as ↓ key)">▼</button>
+  </div>
 
   <div id="nodeInfoPopover" class="node-info-popover" style="display: none;" role="dialog" aria-label="Node details">
     <button type="button" id="nodeInfoClose" class="node-info-close" aria-label="Close">&times;</button>
     <div id="nodeInfoTitle" class="node-info-heading"></div>
     <div id="nodeInfoPath" class="node-info-path"></div>
     <div id="nodeInfoBody" class="node-info-body"></div>
-    <button type="button" id="nodeInfoBacktrack" class="node-info-backtrack">Backtrack</button>
+    <button type="button" id="nodeInfoNext" class="node-info-next">Next</button>
   </div>
 
   <script nonce="${nonce}" src="${visNetworkUri}"></script>
@@ -394,6 +513,11 @@ export class GraphPanel {
   }
 
   private dispose(): void {
+    for (const [, w] of this.exportWaiters) {
+      clearTimeout(w.timeout);
+      w.resolve(null);
+    }
+    this.exportWaiters.clear();
     GraphPanel.instance = undefined;
     this.panel.dispose();
     while (this.disposables.length) {

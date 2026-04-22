@@ -218,12 +218,12 @@ function fileNodeToGraphSnapshot(
     });
 
     for (const child of node.internalFiles) {
-      const edgeKey = `${node.relPath}->${child.relPath}`;
+      const edgeKey = `${child.relPath}->${node.relPath}`;
       if (!seenEdges.has(edgeKey)) {
         seenEdges.add(edgeKey);
         edges.push({
-          from: node.relPath,
-          to: child.relPath,
+          from: child.relPath,
+          to: node.relPath,
           color: { color: 'rgba(255,255,255,0.15)', highlight: '#FFC107', hover: '#FFC107' },
           width: 1.5,
           selectionWidth: 2,
@@ -255,7 +255,7 @@ function fileNodeToGraphSnapshot(
     borderWidthSelected: 3,
     margin: 10,
   });
-  edges.unshift({ from: routeName, to: rootId, color: { color: 'rgba(255,255,255,0.3)', highlight: '#FFC107', hover: '#FFC107' }, width: 2, selectionWidth: 2, smooth: false });
+  edges.unshift({ from: rootId, to: routeName, color: { color: 'rgba(255,255,255,0.3)', highlight: '#FFC107', hover: '#FFC107' }, width: 2, selectionWidth: 2, smooth: false });
 
   return {
     nodes,

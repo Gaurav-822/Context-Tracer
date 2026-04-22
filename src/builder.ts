@@ -74,12 +74,13 @@ export function buildGraphSnapshots(data: ApiJsonData): GraphData {
       }
 
       if (parentId) {
-        const edgeKey = `${parentId}->${nodeId}`;
+        // Edge direction: imported file -> importer (arrow on consumer matches "pulls this in").
+        const edgeKey = `${nodeId}->${parentId}`;
         if (!seenEdges.has(edgeKey)) {
           seenEdges.add(edgeKey);
           localEdges.push({
-            from: parentId,
-            to: nodeId,
+            from: nodeId,
+            to: parentId,
             color: { color: 'rgba(255,255,255,0.15)', highlight: '#FFC107', hover: '#FFC107' },
             width: 1.5,
             selectionWidth: 2,
@@ -154,8 +155,8 @@ export function buildGraphSnapshots(data: ApiJsonData): GraphData {
       };
 
       localEdges.push({
-        from: apiRoute,
-        to: controllerId,
+        from: controllerId,
+        to: apiRoute,
         color: { color: 'rgba(255,255,255,0.15)', highlight: '#FFC107', hover: '#FFC107' },
         width: 1.5,
         selectionWidth: 2,

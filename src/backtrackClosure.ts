@@ -1,10 +1,11 @@
 /**
- * Build the set of open editor files that transitively import a seed file (reverse import closure).
+ * Find files that import a seed module: open-editor transitive closure, or full-workspace direct importers.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { getAllLocalImportSpecsForGraph } from './usedImports';
 
 const IMPORT_REGEX = /(?:import\s+(?:[\s\S]*?\s+from\s+)?|(?:const|var|let)\s+\w+\s*=\s*require\s*\()\s*["'`]([^"'`]+)["'`]/g;
 
@@ -39,6 +40,64 @@ export function resolveLocalFilePath(baseDir: string, importPath: string): strin
   return null;
 }
 
+function tryResolveFileOnDisk(fullPathNoExt: string): string | null {
+  const extensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', ''];
+  for (const ext of extensions) {
+    const candidate = ext ? (fullPathNoExt.endsWith(ext) ? fullPathNoExt : fullPathNoExt + ext) : fullPathNoExt;
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* ignore */
+    }
+    const idx = path.join(candidate, `index${ext || '.ts'}`);
+    try {
+      if (fs.existsSync(idx) && fs.statSync(idx).isFile()) return idx;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function isBareNpmPackage(spec: string): boolean {
+  if (spec.startsWith('.') || spec.startsWith('/')) return false;
+  if (spec.startsWith('@')) {
+    const parts = spec.split('/');
+    return parts.length <= 2;
+  }
+  return !spec.includes('/');
+}
+
+/** Resolve a graph-relevant import spec to an absolute file under `projectRoot` (relative, /, @/, ~/, path aliases). */
+export function resolveProjectImportToAbs(baseDir: string, spec: string, projectRoot: string): string | null {
+  const normRoot = path.resolve(projectRoot);
+  const underProject = (abs: string) => {
+    const r = path.resolve(abs);
+    return r === normRoot || r.startsWith(normRoot + path.sep);
+  };
+
+  if (spec.startsWith('.') || spec.startsWith('/')) {
+    const fullPath = spec.startsWith('/') ? spec : path.resolve(baseDir, spec);
+    const hit = tryResolveFileOnDisk(fullPath);
+    return hit && underProject(hit) ? hit : null;
+  }
+
+  if (isBareNpmPackage(spec)) return null;
+
+  const candidates: string[] = [];
+  if (spec.startsWith('@/') || spec.startsWith('~/')) {
+    candidates.push(path.join(projectRoot, 'src', spec.slice(2)));
+  }
+  candidates.push(path.join(projectRoot, spec));
+  candidates.push(path.join(projectRoot, 'src', spec));
+
+  for (const c of candidates) {
+    const hit = tryResolveFileOnDisk(c);
+    if (hit && underProject(hit)) return hit;
+  }
+  return null;
+}
+
 function normRel(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\//, '');
 }
@@ -60,7 +119,7 @@ function relPathsEqual(a: string, b: string, projectRoot: string): boolean {
 export interface ImporterClosureResult {
   /** All reachable rel paths including seed (workspace-relative). */
   closureRelPaths: string[];
-  /** Edges: importer -> imported (imported is the dependency target). */
+  /** Edges: imported module -> importer (same convention as the main graph). */
   edges: Array<{ from: string; to: string }>;
 }
 
@@ -109,7 +168,7 @@ export function computeImporterClosureFromOpenEditors(
         const resRel = normRel(path.relative(root, resolvedAbs));
         if (relPathsEqual(resRel, cur, projectRoot)) {
           importsCur = true;
-          edges.push({ from: rel, to: cur });
+          edges.push({ from: cur, to: rel });
           break;
         }
       }
@@ -124,4 +183,65 @@ export function computeImporterClosureFromOpenEditors(
     closureRelPaths: [...closure].sort((a, b) => a.localeCompare(b)),
     edges,
   };
+}
+
+const WORKSPACE_SCAN_EXCLUDE =
+  '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/.next/**,**/coverage/**}';
+
+/**
+ * Every workspace JS/TS file that has a static import / export-from / dynamic import() / require()
+ * resolving to `seedRelPath` (one hop only). Same edge convention as the graph: from imported → importer.
+ */
+export async function computeDirectImportersFromWorkspace(
+  seedRelPath: string,
+  projectRoot: string,
+  token?: vscode.CancellationToken
+): Promise<ImporterClosureResult> {
+  const seed = normRel(seedRelPath);
+  const projRootAbs = path.resolve(projectRoot);
+  const seedAbs = path.resolve(projRootAbs, seed.split('/').join(path.sep));
+  const edgeKeys = new Set<string>();
+  const edges: Array<{ from: string; to: string }> = [];
+  const importers = new Set<string>();
+
+  const uris = await vscode.workspace.findFiles(
+    '**/*.{ts,tsx,js,jsx,mjs,cjs}',
+    WORKSPACE_SCAN_EXCLUDE,
+    12000,
+    token
+  );
+
+  for (const uri of uris) {
+    if (token?.isCancellationRequested) break;
+    const importerAbs = uri.fsPath;
+    if (!importerAbs.startsWith(projRootAbs + path.sep) && importerAbs !== projRootAbs) continue;
+
+    const rel = normRel(path.relative(projectRoot, importerAbs));
+    if (rel === seed || rel.includes('::')) continue;
+
+    let specs: Set<string>;
+    try {
+      specs = getAllLocalImportSpecsForGraph(importerAbs);
+    } catch {
+      continue;
+    }
+    if (specs.size === 0) continue;
+
+    const importerDir = path.dirname(importerAbs);
+    for (const spec of specs) {
+      const resolved = resolveProjectImportToAbs(importerDir, spec, projectRoot);
+      if (!resolved) continue;
+      if (path.resolve(resolved) !== path.resolve(seedAbs)) continue;
+      const k = `${seed}->${rel}`;
+      if (!edgeKeys.has(k)) {
+        edgeKeys.add(k);
+        edges.push({ from: seed, to: rel });
+      }
+      importers.add(rel);
+      break;
+    }
+  }
+
+  const closureRelPaths = [seed, ...[...importers].sort((a, b) => a.localeCompare(b))];
+  return { closureRelPaths, edges };
 }

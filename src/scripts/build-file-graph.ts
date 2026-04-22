@@ -166,12 +166,12 @@ function toGraphSnapshot(root: FileNode, routeName: string) {
       isController: isRoot,
     });
     for (const c of n.internalFiles) {
-      const key = `${n.relPath}->${c.relPath}`;
+      const key = `${c.relPath}->${n.relPath}`;
       if (!seenEdges.has(key)) {
         seenEdges.add(key);
         edges.push({
-          from: n.relPath,
-          to: c.relPath,
+          from: c.relPath,
+          to: n.relPath,
           color: { color: 'rgba(255,255,255,0.15)', highlight: '#FFC107', hover: '#FFC107' },
           width: 1.5,
           selectionWidth: 2,
@@ -197,8 +197,8 @@ function toGraphSnapshot(root: FileNode, routeName: string) {
     margin: 10,
   });
   edges.unshift({
-    from: routeName,
-    to: rootId,
+    from: rootId,
+    to: routeName,
     color: { color: 'rgba(255,255,255,0.3)', highlight: '#FFC107', hover: '#FFC107' },
     width: 2,
     selectionWidth: 2,

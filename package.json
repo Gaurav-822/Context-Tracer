@@ -140,7 +140,7 @@
         {
           "type": "webview",
           "id": "apiGraphVisualizer.fileDropTree",
-          "name": "Build From File"
+          "name": "Explorer Map"
         }
       ]
     },

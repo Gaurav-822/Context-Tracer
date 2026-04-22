@@ -19,6 +19,9 @@ export interface NodeData {
   isController?: boolean;
   /** BFS depth from entry file (0 = entry). Used for layered reveal in the webview. */
   importLevel?: number;
+  /** Canvas coordinates from Map View (persisted on save when fixedLayout is set). */
+  x?: number;
+  y?: number;
 }
 
 export interface EdgeData {
@@ -42,9 +45,14 @@ export interface GraphSnapshot {
   controllerMethods: Record<string, MethodInfo[]>;
   defaultMethodId: string | null;
   controllerId: string | null;
+  /**
+   * When true and every node has finite x/y, the webview skips physics and uses saved coordinates.
+   * Set when the user saves from Map View so layouts round-trip exactly.
+   */
+  fixedLayout?: boolean;
 }
 
-/** Written into saved JSON after Backtrack; UI state does not rely on filename. */
+/** Written into saved JSON after a Next (workspace importers) scan; UI state does not rely on filename. */
 export interface GraphDataBacktrackMeta {
   seedNodeRelPath: string;
   closureRelPaths: string[];
