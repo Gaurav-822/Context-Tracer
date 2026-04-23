@@ -16,6 +16,7 @@
   const nodeInfoBody = document.getElementById('nodeInfoBody');
   const nodeInfoClose = document.getElementById('nodeInfoClose');
   const nodeInfoNext = document.getElementById('nodeInfoNext');
+  const nodeInfoRevert = document.getElementById('nodeInfoRevert');
 
   /** @type {Map<string, { graphSnapshots: object, routeNames: string[], initialRouteId?: string }>} */
   const sessions = new Map();
@@ -63,6 +64,21 @@
   let marqueeState = null;
   /** Before the drag exceeds the slop threshold, hold intent here so click-to-deselect still reaches vis. */
   let marqueePending = null;
+  let editingSessionKey = null;
+  let untitledSessionCounter = 1;
+  let tabMenuEl = null;
+  let tabMenuSessionKey = null;
+  let placementSearchEl = null;
+  let placementSearchInputEl = null;
+  let placementSearchListEl = null;
+  let placementMarker = null;
+  let placementPulseRaf = 0;
+  let placementSearchState = {
+    visible: false,
+    requestToken: null,
+    items: [],
+    selectedIndex: 0,
+  };
 
   function clearLayerRevealTimers() {
     layerRevealTimers.forEach((id) => clearTimeout(id));
@@ -197,6 +213,72 @@
     });
   }
 
+  function removeSelectedNodesFromCurrentGraph() {
+    if (!network || !nodes || !edges || !activeSessionKey || !currentRouteId) return false;
+    const selectedIds = network.getSelectedNodes ? network.getSelectedNodes() || [] : [];
+    if (!selectedIds.length) return false;
+    const selectedSet = new Set(selectedIds);
+    const ent = sessions.get(activeSessionKey);
+    if (!ent || !ent.graphSnapshots) return false;
+    const snap = ent.graphSnapshots[currentRouteId];
+    if (!snap) return false;
+
+    let touched = false;
+    if (Array.isArray(snap.nodes)) {
+      const nextNodes = snap.nodes.filter((n) => !selectedSet.has(n.id));
+      if (nextNodes.length !== snap.nodes.length) {
+        snap.nodes = nextNodes;
+        touched = true;
+      }
+    }
+    if (Array.isArray(snap.edges)) {
+      const nextEdges = snap.edges.filter((e) => !selectedSet.has(e.from) && !selectedSet.has(e.to));
+      if (nextEdges.length !== snap.edges.length) {
+        snap.edges = nextEdges;
+        touched = true;
+      }
+    }
+    if (!touched) return false;
+
+    for (const id of selectedIds) {
+      try {
+        nodes.remove(id);
+      } catch (_e) {
+        /* ignore */
+      }
+      delete originals[id];
+      delete baseNodeSizes[id];
+      delete nodeTitleById[id];
+      delete nodeImportLevelById[id];
+    }
+
+    for (const eid of [...edges.getIds()]) {
+      const edge = edges.get(eid);
+      if (!edge) continue;
+      if (!selectedSet.has(edge.from) && !selectedSet.has(edge.to)) continue;
+      try {
+        edges.remove(eid);
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+
+    if (nodeCountEl) nodeCountEl.textContent = String(nodes.length);
+    if (edgeCountEl) edgeCountEl.textContent = String(edges.length);
+    hideNodeInfoPopover();
+    bfsNavAnchorNodeId = null;
+    bfsNavCurrentLevel = null;
+    bfsNavIsActive = false;
+    markGraphSessionDirty(activeSessionKey);
+    applyCurrentHighlightMode();
+    try {
+      network.redraw();
+    } catch (_e) {
+      /* ignore */
+    }
+    return true;
+  }
+
   function normalizeNodePath(p) {
     return String(p || '').replace(/\\/g, '/').replace(/^\.?\//, '').trim().toLowerCase();
   }
@@ -261,6 +343,260 @@
     renderTabBar();
   }
 
+  function commitSessionLabel(sessionKey, rawLabel) {
+    const ent = sessions.get(sessionKey);
+    if (!ent) return;
+    const trimmed = String(rawLabel || '').trim();
+    if (trimmed) {
+      ent.displayLabel = trimmed;
+      vscode.postMessage({
+        type: 'cmd:renameSession',
+        sourceJsonPath: sessionKey,
+        displayLabel: trimmed,
+      });
+    } else if (!ent.displayLabel) {
+      ent.displayLabel = `Untitled ${untitledSessionCounter++}`;
+    }
+    editingSessionKey = null;
+    renderTabBar();
+  }
+
+  function hideTabMenu() {
+    if (!tabMenuEl) return;
+    tabMenuEl.classList.remove('visible');
+    tabMenuSessionKey = null;
+  }
+
+  function ensureTabMenu() {
+    if (tabMenuEl) return tabMenuEl;
+    const menu = document.createElement('div');
+    menu.className = 'graph-tab-floating-menu';
+    menu.innerHTML = '<button type="button" data-action="rename">Rename</button>';
+    document.body.appendChild(menu);
+    menu.querySelectorAll('button[data-action]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const action = btn.getAttribute('data-action');
+        const key = tabMenuSessionKey;
+        hideTabMenu();
+        if (!key || action !== 'rename') return;
+        editingSessionKey = key;
+        renderTabBar();
+        focusTabRenameInput(key);
+      });
+    });
+    document.addEventListener(
+      'mousedown',
+      (e) => {
+        if (!menu.classList.contains('visible')) return;
+        if (menu.contains(e.target)) return;
+        hideTabMenu();
+      },
+      true
+    );
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') hideTabMenu();
+    });
+    tabMenuEl = menu;
+    return menu;
+  }
+
+  function showTabMenu(clientX, clientY, sessionKey) {
+    const menu = ensureTabMenu();
+    tabMenuSessionKey = sessionKey;
+    menu.classList.add('visible');
+    requestAnimationFrame(() => {
+      const pad = 8;
+      const rect = menu.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      let left = clientX;
+      let top = clientY;
+      if (left + rect.width > vw - pad) left = Math.max(pad, vw - rect.width - pad);
+      if (top + rect.height > vh - pad) top = Math.max(pad, vh - rect.height - pad);
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+    });
+  }
+
+  function focusTabRenameInput(sessionKey) {
+    setTimeout(() => {
+      const el = tabBar && tabBar.querySelector(`input.graph-tab-input[data-session-key="${sessionKey}"]`);
+      if (!el) return;
+      try {
+        el.focus();
+        el.select();
+      } catch (_e) {
+        /* ignore */
+      }
+    }, 0);
+  }
+
+  function ensurePlacementSearchUi() {
+    if (placementSearchEl) return;
+    const root = document.createElement('div');
+    root.id = 'graph-placement-search';
+    root.innerHTML =
+      '<input class="gps-input" type="text" placeholder="Search files to place..." />' +
+      '<div class="gps-list"></div>';
+    document.body.appendChild(root);
+    placementSearchEl = root;
+    placementSearchInputEl = root.querySelector('.gps-input');
+    placementSearchListEl = root.querySelector('.gps-list');
+    placementSearchInputEl.addEventListener('input', () => {
+      requestPlacementSearch(placementSearchInputEl.value);
+    });
+    placementSearchInputEl.addEventListener('keydown', (e) => {
+      if (!placementSearchState.visible) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        movePlacementSelection(1);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        movePlacementSelection(-1);
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitPlacementSelection();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closePlacementSearch();
+      }
+    });
+    document.addEventListener(
+      'mousedown',
+      (e) => {
+        if (!placementSearchState.visible || !placementSearchEl) return;
+        if (placementSearchEl.contains(e.target)) return;
+        closePlacementSearch();
+      },
+      true
+    );
+  }
+
+  function renderPlacementResults() {
+    if (!placementSearchListEl) return;
+    const items = placementSearchState.items || [];
+    placementSearchListEl.innerHTML = '';
+    if (items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'gps-empty';
+      empty.textContent = 'No files found';
+      placementSearchListEl.appendChild(empty);
+      return;
+    }
+    items.forEach((item, idx) => {
+      const row = document.createElement('div');
+      row.className = `gps-item${idx === placementSearchState.selectedIndex ? ' active' : ''}`;
+      row.innerHTML = `${item.label}<small>${item.relPath}</small>`;
+      row.addEventListener('mouseenter', () => {
+        placementSearchState.selectedIndex = idx;
+        renderPlacementResults();
+      });
+      row.addEventListener('click', () => {
+        placementSearchState.selectedIndex = idx;
+        commitPlacementSelection();
+      });
+      placementSearchListEl.appendChild(row);
+    });
+  }
+
+  function movePlacementSelection(delta) {
+    const n = placementSearchState.items.length;
+    if (!n) return;
+    placementSearchState.selectedIndex = (placementSearchState.selectedIndex + delta + n) % n;
+    renderPlacementResults();
+    const rows = placementSearchListEl.querySelectorAll('.gps-item');
+    const active = rows[placementSearchState.selectedIndex];
+    if (active) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  function requestPlacementSearch(query) {
+    if (!activeSessionKey) return;
+    const token = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    placementSearchState.requestToken = token;
+    vscode.postMessage({
+      type: 'cmd:searchWorkspaceFiles',
+      sourceJsonPath: activeSessionKey,
+      query: String(query || ''),
+      requestToken: token,
+    });
+  }
+
+  function openPlacementSearchAt(canvasPoint, domPoint) {
+    ensurePlacementSearchUi();
+    placementMarker = {
+      x: canvasPoint.x,
+      y: canvasPoint.y,
+      startedAt: performance.now(),
+    };
+    placementSearchState.visible = true;
+    placementSearchState.items = [];
+    placementSearchState.selectedIndex = 0;
+    const x = Math.max(8, Math.min(window.innerWidth - 540, domPoint.x + 14));
+    const y = Math.max(8, Math.min(window.innerHeight - 320, domPoint.y + 14));
+    placementSearchEl.style.left = `${x}px`;
+    placementSearchEl.style.top = `${y}px`;
+    placementSearchEl.classList.add('visible');
+    placementSearchInputEl.value = '';
+    placementSearchInputEl.focus();
+    requestPlacementSearch('');
+    if (!placementPulseRaf) {
+      const tick = () => {
+        if (!placementMarker || !network) {
+          placementPulseRaf = 0;
+          return;
+        }
+        try {
+          network.redraw();
+        } catch (_e) {
+          /* ignore */
+        }
+        placementPulseRaf = requestAnimationFrame(tick);
+      };
+      placementPulseRaf = requestAnimationFrame(tick);
+    }
+  }
+
+  function closePlacementSearch() {
+    placementSearchState.visible = false;
+    placementSearchState.requestToken = null;
+    placementSearchState.items = [];
+    placementSearchState.selectedIndex = 0;
+    placementMarker = null;
+    if (placementSearchEl) placementSearchEl.classList.remove('visible');
+    if (placementPulseRaf) {
+      cancelAnimationFrame(placementPulseRaf);
+      placementPulseRaf = 0;
+    }
+    try {
+      network && network.redraw();
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  function commitPlacementSelection() {
+    const items = placementSearchState.items || [];
+    const idx = placementSearchState.selectedIndex;
+    const item = items[idx];
+    if (!item || !placementMarker || !activeSessionKey || !currentRouteId) return;
+    vscode.postMessage({
+      type: 'cmd:addNodeFromDrop',
+      droppedPath: item.absPath,
+      routeId: currentRouteId,
+      sourceJsonPath: activeSessionKey,
+      dropX: placementMarker.x,
+      dropY: placementMarker.y,
+    });
+    closePlacementSearch();
+  }
+
   function renderTabBar() {
     if (!tabBar) return;
     tabBar.innerHTML = '';
@@ -279,10 +615,35 @@
         dirtyDot.title = 'Unsaved changes — press Ctrl+S (or double-click tab for a new copy in Saved)';
         tab.appendChild(dirtyDot);
       }
-      const label = document.createElement('span');
-      label.className = 'graph-tab-label';
-      label.textContent = (s && s.displayLabel) || labelForSession(key);
-      tab.appendChild(label);
+      if (editingSessionKey === key) {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'graph-tab-input';
+        input.setAttribute('data-session-key', key);
+        input.value = (s && s.displayLabel) || labelForSession(key);
+        input.addEventListener('click', (e) => e.stopPropagation());
+        input.addEventListener('dblclick', (e) => e.stopPropagation());
+        input.addEventListener('keydown', (e) => {
+          e.stopPropagation();
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commitSessionLabel(key, input.value);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            editingSessionKey = null;
+            renderTabBar();
+          }
+        });
+        input.addEventListener('blur', () => {
+          commitSessionLabel(key, input.value);
+        });
+        tab.appendChild(input);
+      } else {
+        const label = document.createElement('span');
+        label.className = 'graph-tab-label';
+        label.textContent = (s && s.displayLabel) || labelForSession(key);
+        tab.appendChild(label);
+      }
 
       const close = document.createElement('button');
       close.type = 'button';
@@ -291,6 +652,7 @@
       close.textContent = '×';
       close.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (editingSessionKey === key) editingSessionKey = null;
         sessions.delete(key);
         sessionOrder = sessionOrder.filter((k) => k !== key);
         if (activeSessionKey === key) {
@@ -325,10 +687,30 @@
       });
       tab.addEventListener('dblclick', (e) => {
         e.stopPropagation();
-        postSaveSessionForKey(key, true);
+        hideTabMenu();
+        editingSessionKey = key;
+        renderTabBar();
+        focusTabRenameInput(key);
+      });
+      tab.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showTabMenu(e.clientX, e.clientY, key);
       });
       tabBar.appendChild(tab);
     });
+
+    const addTabBtn = document.createElement('button');
+    addTabBtn.type = 'button';
+    addTabBtn.className = 'graph-tab graph-tab-add';
+    addTabBtn.setAttribute('aria-label', 'Add new graph tab');
+    addTabBtn.textContent = '+';
+    addTabBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideTabMenu();
+      vscode.postMessage({ type: 'cmd:createEmptyGraph' });
+    });
+    tabBar.appendChild(addTabBtn);
   }
 
   function applyActiveSession() {
@@ -401,6 +783,11 @@
     }
 
     applyActiveSession();
+    if (message.startRename) {
+      editingSessionKey = sourceJsonPath;
+      renderTabBar();
+      focusTabRenameInput(sourceJsonPath);
+    }
   }
 
   /**
@@ -497,6 +884,21 @@
       ctx.lineWidth = 2 / scale;
       ctx.fillRect(xMin, yMin, xMax - xMin, yMax - yMin);
       ctx.strokeRect(xMin, yMin, xMax - xMin, yMax - yMin);
+      ctx.restore();
+    });
+    network.on('afterDrawing', (ctx) => {
+      if (!placementMarker || !network) return;
+      const t = (performance.now() - placementMarker.startedAt) / 1000;
+      const s = Math.max(0.01, network.getScale() || 1);
+      const r = (18 + 6 * Math.sin(t * 4)) / s;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(placementMarker.x, placementMarker.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(88,166,255,0.18)';
+      ctx.fill();
+      ctx.lineWidth = 2 / s;
+      ctx.strokeStyle = 'rgba(88,166,255,0.95)';
+      ctx.stroke();
       ctx.restore();
     });
 
@@ -666,6 +1068,9 @@
       const selectedIds = network.getSelectedNodes();
       if (!selectedIds || selectedIds.length === 0) return;
       const selectedId = selectedIds[0];
+      if (selectedIds.length === 1 && !String(selectedId).includes('::') && !String(selectedId).startsWith('Import:')) {
+        vscode.postMessage({ type: 'cmd:selectInWorkspace', filePath: String(selectedId) });
+      }
       bfsNavAnchorNodeId = selectedId;
       bfsNavCurrentLevel = getNodeImportLevel(selectedId);
       bfsNavIsActive = false;
@@ -729,9 +1134,41 @@
       }
     });
     network.on('doubleClick', (params) => {
-      if (!params.nodes || params.nodes.length === 0) return;
+      if (params.nodes && params.nodes.length > 0) {
+        hideNodeInfoPopover();
+        vscode.postMessage({ type: 'cmd:openFile', filePath: params.nodes[0] });
+        return;
+      }
+      if (!params.pointer || !params.pointer.canvas || !params.pointer.DOM) return;
       hideNodeInfoPopover();
-      vscode.postMessage({ type: 'cmd:openFile', filePath: params.nodes[0] });
+      if (!activeSessionKey || !currentRouteId) return;
+      placementMarker = {
+        x: params.pointer.canvas.x,
+        y: params.pointer.canvas.y,
+        startedAt: performance.now(),
+      };
+      if (!placementPulseRaf) {
+        const tick = () => {
+          if (!placementMarker || !network) {
+            placementPulseRaf = 0;
+            return;
+          }
+          try {
+            network.redraw();
+          } catch (_e) {
+            /* ignore */
+          }
+          placementPulseRaf = requestAnimationFrame(tick);
+        };
+        placementPulseRaf = requestAnimationFrame(tick);
+      }
+      vscode.postMessage({
+        type: 'cmd:startSidebarPlacement',
+        routeId: currentRouteId,
+        sourceJsonPath: activeSessionKey,
+        dropX: params.pointer.canvas.x,
+        dropY: params.pointer.canvas.y,
+      });
     });
 
     network.on('click', (params) => {
@@ -966,6 +1403,19 @@
         });
       });
     }
+    if (nodeInfoRevert) {
+      nodeInfoRevert.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!lastInfoNodeId || !activeSessionKey || !currentRouteId) return;
+        vscode.postMessage({
+          type: 'cmd:revertTraceNode',
+          nodeId: lastInfoNodeId,
+          routeId: currentRouteId,
+          sourceJsonPath: activeSessionKey,
+        });
+        hideNodeInfoPopover();
+      });
+    }
     if (levelNavDeeper) {
       levelNavDeeper.addEventListener('click', (e) => {
         e.preventDefault();
@@ -986,6 +1436,13 @@
     window.addEventListener(
       'keydown',
       (e) => {
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+          if (!isTextInputElement(document.activeElement) && removeSelectedNodesFromCurrentGraph()) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+        }
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
           if (isTextInputElement(document.activeElement)) return;
           // Match upward layout: Up = deeper imports, Down = shallower.
@@ -2020,6 +2477,20 @@
         break;
       case 'cmd:nodeSizeScale':
         if (typeof message.scale === 'number') applyNodeSizeScale(message.scale);
+        break;
+      case 'cmd:workspaceSearchResults':
+        if (!placementSearchState.visible) break;
+        if (message.requestToken !== placementSearchState.requestToken) break;
+        if (message.sourceJsonPath !== activeSessionKey) break;
+        placementSearchState.items = Array.isArray(message.items) ? message.items : [];
+        placementSearchState.selectedIndex = placementSearchState.items.length ? 0 : -1;
+        renderPlacementResults();
+        break;
+      case 'cmd:placementCommitted':
+        closePlacementSearch();
+        break;
+      case 'cmd:placementFailed':
+        closePlacementSearch();
         break;
       case 'cmd:exportGraphSnapshot': {
         const key = message.sourceJsonPath;

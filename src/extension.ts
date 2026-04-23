@@ -7,7 +7,9 @@ import type { GraphPanelLoadMode, UpsertSessionMessage } from './graphPanel';
 import {
   SearchSidebarViewProvider,
   SidebarTreeNode,
+  relPathFromWorkspace,
 } from './searchSidebarView';
+import { getUsedLocalImportSpecsInRange } from './usedImports';
 
 // Heavy modules loaded lazily on first use (keeps activation instant).
 async function lazyGraphPanel() { return import('./graphPanel'); }
@@ -75,6 +77,76 @@ let fileDropTreeView: vscode.TreeView<vscode.TreeItem> | undefined;
 let pendingSidebarDragPaths: string[] | null = null;
 let pendingSidebarDragAt = 0;
 const PENDING_SIDEBAR_DRAG_TTL_MS = 20_000;
+let untitledGraphCounter = 1;
+const customSessionLabelsByPath = new Map<string, string>();
+let workspaceSelectionCurrentAbsPath: string | undefined;
+let workspaceSelectionPreviousAbsPath: string | undefined;
+let pendingGraphPlacement:
+  | { routeId: string; sourceJsonPath: string; dropX: number; dropY: number }
+  | null = null;
+const traceReductionBackupByTarget = new Map<string, GraphSnapshot>();
+let tracedSelectionDecorationType: vscode.TextEditorDecorationType | undefined;
+let tracedSelectionDecorationEditorUri: string | undefined;
+type TracedSelectionTarget = { sourceJsonPath: string; routeId: string; nodeId: string };
+type TracedSelectionContext = { range: vscode.Range; targets: TracedSelectionTarget[] };
+const tracedSelectionContextByEditorUri = new Map<string, TracedSelectionContext>();
+
+function traceReductionBackupKey(sourceJsonPath: string, routeId: string, nodeId: string): string {
+  return `${sourceJsonPath}::${routeId}::${normalizeGraphNodePath(nodeId)}`;
+}
+
+function pushWorkspaceSelection(absPath: string, trackAsUserInteraction = true): void {
+  const normalized = path.normalize(absPath);
+  if (trackAsUserInteraction) {
+    if (workspaceSelectionCurrentAbsPath && workspaceSelectionCurrentAbsPath !== normalized) {
+      workspaceSelectionPreviousAbsPath = workspaceSelectionCurrentAbsPath;
+    }
+    workspaceSelectionCurrentAbsPath = normalized;
+  }
+  searchSidebarProvider.postWorkspaceSelection(normalized);
+}
+
+async function undoWorkspaceSelection(): Promise<void> {
+  if (!workspaceSelectionPreviousAbsPath) {
+    vscode.window.showInformationMessage('No previous workspace selection to restore.');
+    return;
+  }
+  const previous = workspaceSelectionPreviousAbsPath;
+  workspaceSelectionPreviousAbsPath = workspaceSelectionCurrentAbsPath;
+  workspaceSelectionCurrentAbsPath = previous;
+  searchSidebarProvider.postWorkspaceSelection(previous);
+}
+
+function ensureTraceSelectionDecorationType(context: vscode.ExtensionContext): vscode.TextEditorDecorationType {
+  if (!tracedSelectionDecorationType) {
+    tracedSelectionDecorationType = vscode.window.createTextEditorDecorationType({
+      backgroundColor: 'rgba(245, 158, 11, 0.14)',
+      textDecoration: 'rgba(245, 158, 11, 0.95) solid 2px underline',
+      overviewRulerColor: 'rgba(245, 158, 11, 0.85)',
+      overviewRulerLane: vscode.OverviewRulerLane.Right,
+      isWholeLine: false,
+    });
+    context.subscriptions.push(tracedSelectionDecorationType);
+  }
+  return tracedSelectionDecorationType;
+}
+
+function applyTraceSelectionDecoration(
+  context: vscode.ExtensionContext,
+  editor: vscode.TextEditor,
+  range: vscode.Range
+): void {
+  const decoration = ensureTraceSelectionDecorationType(context);
+  if (tracedSelectionDecorationEditorUri && tracedSelectionDecorationEditorUri !== editor.document.uri.toString()) {
+    for (const ed of vscode.window.visibleTextEditors) {
+      if (ed.document.uri.toString() === tracedSelectionDecorationEditorUri) {
+        ed.setDecorations(decoration, []);
+      }
+    }
+  }
+  editor.setDecorations(decoration, [range]);
+  tracedSelectionDecorationEditorUri = editor.document.uri.toString();
+}
 
 export function activate(context: vscode.ExtensionContext) {
   fileDropProvider = new FileDropTreeProvider(context);
@@ -82,6 +154,12 @@ export function activate(context: vscode.ExtensionContext) {
     listSavedGraphsForSidebar: () => listSavedGraphs(),
     onSaveSavedGraphCopyAs: (absPath) => saveSavedGraphCopyAsNewFile(absPath),
     onSavedGraphSaveInPlace: (absPath) => handleSavedGraphSaveInPlace(context, absPath),
+    onCreateEmptyGraph: async () => {
+      await createAndOpenEmptyGraph(context, true);
+    },
+    onRenameWorkspaceItem: async (absPath) => {
+      await renameWorkspaceItem(absPath);
+    },
     onSidebarDragPaths: (paths) => {
       pendingSidebarDragPaths = paths.length ? [...paths] : null;
       pendingSidebarDragAt = paths.length ? Date.now() : 0;
@@ -104,12 +182,27 @@ export function activate(context: vscode.ExtensionContext) {
     onCreateFolder: async () => {
       await createWorkspaceFolder();
     },
+    onUndoWorkspaceReveal: async () => {
+      await undoWorkspaceSelection();
+    },
     onOpenResult: async ({ resultType, absPath }) => {
-      if (resultType === 'folder') {
-        await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(absPath));
+      pushWorkspaceSelection(absPath, true);
+      if (resultType === 'folder') return;
+      await buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
+    },
+    onPlaceInGraph: async (absPath) => {
+      if (!pendingGraphPlacement) {
+        getGraphPanel()?.instance?.postWebviewMessage({ type: 'cmd:placementFailed' });
         return;
       }
-      await buildGraphFromFile(context, absPath, fileDropProvider.useLlm);
+      const p = pendingGraphPlacement;
+      pendingGraphPlacement = null;
+      const ok = await addNodeFromGraphDrop(absPath, p.routeId, p.sourceJsonPath, p.dropX, p.dropY);
+      getGraphPanel()?.instance?.postWebviewMessage({ type: ok ? 'cmd:placementCommitted' : 'cmd:placementFailed' });
+    },
+    onCancelPlaceInGraph: async () => {
+      pendingGraphPlacement = null;
+      getGraphPanel()?.instance?.postWebviewMessage({ type: 'cmd:placementFailed' });
     },
   });
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchSidebarProvider));
@@ -127,6 +220,12 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('apiGraphVisualizer.open', () => { void openVisualizer(context); }),
     vscode.commands.registerCommand('apiGraphVisualizer.focusInGraph', () => focusCurrentFileInGraph()),
     vscode.commands.registerCommand('apiGraphVisualizer.buildFromCurrentFile', () => { void buildFromCurrentFile(context); }),
+    vscode.commands.registerCommand('apiGraphVisualizer.traceFromSelection', () => {
+      void traceFromSelection(context);
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.revertTraceFromSelection', () => {
+      void revertTraceReductionFromSelection(context);
+    }),
     vscode.commands.registerCommand('apiGraphVisualizer.buildFromResource', (resource: vscode.Uri) => {
       if (resource?.fsPath) void buildGraphFromFile(context, resource.fsPath, false);
     }),
@@ -297,6 +396,91 @@ async function createWorkspaceFolder(): Promise<void> {
     const msg = e instanceof Error ? e.message : String(e);
     vscode.window.showErrorMessage(`Could not create folder: ${msg}`);
   }
+}
+
+async function renameWorkspaceItem(absPath: string): Promise<void> {
+  const itemUri = vscode.Uri.file(absPath);
+  let stat: vscode.FileStat;
+  try {
+    stat = await vscode.workspace.fs.stat(itemUri);
+  } catch {
+    vscode.window.showWarningMessage('Item no longer exists.');
+    return;
+  }
+  const isDir = (stat.type & vscode.FileType.Directory) !== 0;
+  const currentName = path.basename(absPath);
+  const nextName = await vscode.window.showInputBox({
+    title: isDir ? 'Rename Folder' : 'Rename File',
+    prompt: 'Enter a new name',
+    value: currentName,
+    ignoreFocusOut: true,
+    validateInput: (v) => {
+      const t = String(v || '').trim();
+      if (!t) return 'Name cannot be empty.';
+      if (t.includes('/') || t.includes('\\')) return 'Use only the item name (no path separators).';
+      return null;
+    },
+  });
+  if (nextName === undefined) return;
+  const clean = nextName.trim();
+  if (!clean || clean === currentName) return;
+  const parentDir = path.dirname(absPath);
+  const targetUri = vscode.Uri.file(path.join(parentDir, clean));
+  try {
+    await vscode.workspace.fs.rename(itemUri, targetUri, { overwrite: false });
+    await vscode.commands.executeCommand('revealInExplorer', targetUri);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Could not rename item: ${msg}`);
+  }
+}
+
+async function createAndOpenEmptyGraph(context: vscode.ExtensionContext, startRename: boolean): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) {
+    vscode.window.showWarningMessage('Open a workspace to create an empty graph.');
+    return;
+  }
+  const activeEditorUri = vscode.window.activeTextEditor?.document.uri;
+  const activeWf = activeEditorUri && activeEditorUri.scheme === 'file'
+    ? vscode.workspace.getWorkspaceFolder(activeEditorUri)
+    : undefined;
+  const wfIndex = activeWf ? Math.max(0, folders.indexOf(activeWf)) : 0;
+  const seed = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const fakeRelPath = `untitled/graph-${seed}.ts`;
+  const sessionKey = makeLiveImportSessionKey(wfIndex, fakeRelPath);
+  const graphData: GraphData = {
+    routeNames: ['Graph'],
+    graphSnapshots: {
+      Graph: { nodes: [], edges: [] },
+    },
+  };
+  lastJsonPath = undefined;
+  lastLiveSessionKey = sessionKey;
+  graphDataByJsonPath.set(sessionKey, graphData);
+  pendingImportEdgesByJsonPath.set(sessionKey, []);
+  const displayLabel = `Untitled ${untitledGraphCounter++}`;
+  const GP = await ensureGraphPanel();
+  GP.open(
+    context.extensionUri,
+    graphData,
+    () => {
+      /* no-op for empty graph */
+    },
+    (filePath) => openFileInEditor(filePath),
+    (filePath) => selectWorkspaceItemFromGraph(filePath),
+    'Graph',
+    sessionKey,
+    'newWindow',
+    {
+      ...graphPanelHooks(context),
+      initialSession: {
+        progressiveReveal: false,
+        displayLabel: customSessionLabelsByPath.get(sessionKey) ?? displayLabel,
+        startRename,
+      },
+    }
+  );
 }
 
 async function buildWorkspaceTree(params: {
@@ -498,13 +682,23 @@ async function buildWorkspaceTree(params: {
 }
 
 function listSavedGraphs(): { label: string; absPath: string; relPath: string }[] {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!root) return [];
-  return scanSavedBacktrackedJson(root).map((absPath) => ({
-    label: path.basename(absPath),
-    absPath,
-    relPath: path.relative(root, absPath).replace(/\\/g, '/'),
-  }));
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) return [];
+  const out: { label: string; absPath: string; relPath: string }[] = [];
+  const multiRoot = folders.length > 1;
+  for (const wf of folders) {
+    const root = wf.uri.fsPath;
+    for (const absPath of scanSavedBacktrackedJson(root)) {
+      const rel = path.relative(root, absPath).replace(/\\/g, '/');
+      out.push({
+        label: path.basename(absPath),
+        absPath,
+        relPath: multiRoot ? `${wf.name}/${rel}` : rel,
+      });
+    }
+  }
+  out.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return out;
 }
 
 /** Overwrite saved JSON from sidebar “Save” (Map View must have session or we open first). */
@@ -545,8 +739,11 @@ async function presentLiveImportGraph(
   const shortLabel = fileRelPath.split('/').pop() || fileRelPath;
 
   const hooks = {
-    ...graphPanelHooks(),
-    initialSession: { progressiveReveal, displayLabel: shortLabel },
+    ...graphPanelHooks(context),
+    initialSession: {
+      progressiveReveal,
+      displayLabel: customSessionLabelsByPath.get(sessionKey) ?? shortLabel,
+    },
   };
 
   const GP = await ensureGraphPanel();
@@ -558,6 +755,7 @@ async function presentLiveImportGraph(
       if (!skipRestore) fileDropProvider.updateDroppedFiles(fileRoutes);
     },
     (filePath) => openFileInEditor(filePath),
+    (filePath) => selectWorkspaceItemFromGraph(filePath),
     fileRoute,
     sessionKey,
     'newWindow',
@@ -575,6 +773,270 @@ async function buildFromCurrentFile(context: vscode.ExtensionContext): Promise<v
     return;
   }
   await buildGraphFromFile(context, filePath, false);
+}
+
+async function traceFromSelection(context: vscode.ExtensionContext): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.scheme !== 'file') return;
+  const selection = editor.selection;
+  if (!selection || selection.isEmpty) {
+    vscode.window.showInformationMessage('Select a code section first, then use "Trace from here".');
+    return;
+  }
+  const filePath = editor.document.uri.fsPath;
+  const ext = path.extname(filePath).toLowerCase();
+  if (!['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+    vscode.window.showWarningMessage('Trace from here supports TypeScript/JavaScript files.');
+    return;
+  }
+  const text = editor.document.getText(selection).trim();
+  if (!text) {
+    vscode.window.showInformationMessage('Selected section is empty.');
+    return;
+  }
+
+  const fileUri = vscode.Uri.file(filePath);
+  const containingFolder = vscode.workspace.getWorkspaceFolder(fileUri);
+  let effectiveRoot = containingFolder?.uri.fsPath;
+  if (!effectiveRoot) {
+    let dir = path.dirname(filePath);
+    while (dir !== path.dirname(dir)) {
+      if (fs.existsSync(path.join(dir, 'package.json'))) {
+        effectiveRoot = dir;
+        break;
+      }
+      dir = path.dirname(dir);
+    }
+    effectiveRoot ??= path.dirname(filePath);
+  }
+  const relPath = path.relative(effectiveRoot, filePath).replace(/\\/g, '/');
+  const startOffset = editor.document.offsetAt(selection.start);
+  const endOffset = editor.document.offsetAt(selection.end);
+  const usedSpecs = getUsedLocalImportSpecsInRange(filePath, startOffset, endOffset);
+  if (usedSpecs.size === 0) {
+    vscode.window.showWarningMessage('No local imports are referenced in the selected section.');
+    return;
+  }
+
+  const fromHereTag = `from L${selection.start.line + 1}-${selection.end.line + 1}`;
+  const status = vscode.window.setStatusBarMessage('Building graph from selected section...');
+  try {
+    const normTarget = normalizeGraphNodePath(relPath);
+    const targets: Array<{ sourceJsonPath: string; routeId: string }> = [];
+    for (const [sourceJsonPath, gd] of graphDataByJsonPath.entries()) {
+      for (const routeId of gd.routeNames || []) {
+        const snap = gd.graphSnapshots[routeId];
+        if (!snap?.nodes?.length) continue;
+        const hasNode = snap.nodes.some(
+          (n) => !String(n.id).startsWith('Import:') && normalizeGraphNodePath(String(n.id || '')) === normTarget
+        );
+        if (hasNode) targets.push({ sourceJsonPath, routeId });
+      }
+    }
+    if (targets.length === 0) {
+      vscode.window.showWarningMessage('This file is not present in any currently loaded graph.');
+      return;
+    }
+
+    const { buildFileGraph } = await lazyFileGraphBuilder();
+    const tracedGraph = await buildFileGraph(filePath, effectiveRoot, false, {
+      rootImportSpecs: usedSpecs,
+      routeNameSuffix: fromHereTag,
+      tracedSelectionLabel: `Trace from selected code (${fromHereTag})`,
+    });
+    const tracedRouteId = tracedGraph.routeNames.find((r) => r.startsWith('Import:')) ?? tracedGraph.routeNames[0];
+    const tracedSnap = tracedGraph.graphSnapshots[tracedRouteId];
+    if (!tracedSnap) {
+      vscode.window.showWarningMessage('Could not build traced snapshot.');
+      return;
+    }
+
+    const normalize = (p: string) => normalizeGraphNodePath(String(p || ''));
+    const tracedRootNode =
+      tracedSnap.nodes.find((n) => normalize(String(n.id || '')) === normTarget) ??
+      tracedSnap.nodes.find((n) => !String(n.id || '').startsWith('Import:'));
+    if (!tracedRootNode) {
+      vscode.window.showWarningMessage('Trace root node is missing in traced snapshot.');
+      return;
+    }
+    const tracedRootId = String(tracedRootNode.id);
+
+    const appliedTargets: TracedSelectionTarget[] = [];
+    for (const t of targets) {
+      const existing = graphDataByJsonPath.get(t.sourceJsonPath);
+      if (!existing) continue;
+      const snap = existing.graphSnapshots[t.routeId];
+      if (!snap) continue;
+      const targetNodeId =
+        (snap.nodes || []).find((n) => !String(n.id).startsWith('Import:') && normalize(String(n.id || '')) === normTarget)?.id ??
+        relPath;
+      appliedTargets.push({
+        sourceJsonPath: t.sourceJsonPath,
+        routeId: t.routeId,
+        nodeId: String(targetNodeId),
+      });
+
+      // Nodes reachable as imports of target (walk edges dep -> importer backwards via `to === current`).
+      const closure = new Set<string>();
+      const stack = [String(targetNodeId)];
+      closure.add(String(targetNodeId));
+      while (stack.length) {
+        const cur = stack.pop()!;
+        for (const e of snap.edges || []) {
+          if (String(e.to) !== cur) continue;
+          const dep = String(e.from);
+          if (dep.startsWith('Import:')) continue;
+          if (!closure.has(dep)) {
+            closure.add(dep);
+            stack.push(dep);
+          }
+        }
+      }
+
+      const backupKey = traceReductionBackupKey(t.sourceJsonPath, t.routeId, String(targetNodeId));
+      traceReductionBackupByTarget.set(backupKey, JSON.parse(JSON.stringify(snap)) as GraphSnapshot);
+
+      const closureNorm = new Set<string>([...closure].map((id) => normalize(id)));
+      const allowedNodeNorm = new Set<string>();
+      for (const tn of tracedSnap.nodes || []) {
+        const idStr = String(tn.id || '');
+        if (idStr.startsWith('Import:')) continue;
+        const mapped = normalize(idStr) === normalize(tracedRootId) ? String(targetNodeId) : idStr;
+        allowedNodeNorm.add(normalize(mapped));
+      }
+      allowedNodeNorm.add(normalize(String(targetNodeId)));
+
+      const allowedEdgeNorm = new Set<string>();
+      for (const te of tracedSnap.edges || []) {
+        const fromRaw = String(te.from || '');
+        const toRaw = String(te.to || '');
+        if (fromRaw.startsWith('Import:') || toRaw.startsWith('Import:')) continue;
+        const mappedFrom = normalize(fromRaw) === normalize(tracedRootId) ? String(targetNodeId) : fromRaw;
+        const mappedTo = normalize(toRaw) === normalize(tracedRootId) ? String(targetNodeId) : toRaw;
+        allowedEdgeNorm.add(`${normalize(mappedFrom)}->${normalize(mappedTo)}`);
+      }
+
+      const removedNodeNorm = new Set<string>();
+      snap.nodes = (snap.nodes || []).filter((n) => {
+        const id = String(n.id || '');
+        const nid = normalize(id);
+        if (!closureNorm.has(nid)) return true;
+        if (nid === normalize(String(targetNodeId))) return true;
+        const keep = allowedNodeNorm.has(nid);
+        if (!keep) removedNodeNorm.add(nid);
+        return keep;
+      });
+
+      snap.edges = (snap.edges || []).filter((e) => {
+        const fromN = normalize(String(e.from || ''));
+        const toN = normalize(String(e.to || ''));
+        if (removedNodeNorm.has(fromN) || removedNodeNorm.has(toN)) return false;
+        if (closureNorm.has(fromN) && closureNorm.has(toN)) {
+          return allowedEdgeNorm.has(`${fromN}->${toN}`);
+        }
+        return true;
+      });
+
+      const targetNode = (snap.nodes || []).find(
+        (n) => normalize(String(n.id || '')) === normalize(String(targetNodeId))
+      );
+      if (targetNode) {
+        targetNode.color = {
+          background: '#F59E0B',
+          border: '#B45309',
+          highlight: { background: '#FBBF24', border: '#FDE68A' },
+          hover: { background: '#FBBF24', border: '#FDE68A' },
+        };
+        targetNode.shape = 'star';
+        targetNode.size = Math.max(targetNode.size || 40, 48);
+        targetNode.borderWidth = Math.max(targetNode.borderWidth || 1.5, 3);
+        const prevTitle = typeof targetNode.title === 'string' ? targetNode.title : String(targetNode.id || '');
+        const marker = `Trace reduced from selection (${fromHereTag})`;
+        if (!prevTitle.includes(marker)) {
+          targetNode.title = `${prevTitle}\n\n${marker}`;
+        }
+      }
+
+      existing.graphSnapshots[t.routeId] = snap;
+      graphDataByJsonPath.set(t.sourceJsonPath, existing);
+
+      const msg: UpsertSessionMessage = {
+        type: 'upsertSession',
+        sourceJsonPath: t.sourceJsonPath,
+        graphSnapshots: existing.graphSnapshots,
+        routeNames: existing.routeNames,
+        initialRouteId: t.routeId,
+        sessionMode: 'replace',
+        unsavedChanges: true,
+        mergeInPlace: true,
+      };
+      getGraphPanel()?.instance?.deliverUpsertExternal(msg);
+      getGraphPanel()?.instance?.postSessionState({ sourceJsonPath: t.sourceJsonPath, unsavedChanges: true });
+    }
+    applyTraceSelectionDecoration(context, editor, new vscode.Range(selection.start, selection.end));
+    tracedSelectionContextByEditorUri.set(editor.document.uri.toString(), {
+      range: new vscode.Range(selection.start, selection.end),
+      targets: appliedTargets,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Failed to trace from selection: ${message}`);
+  } finally {
+    status.dispose();
+  }
+}
+
+async function revertTraceReductionFromSelection(context: vscode.ExtensionContext): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.scheme !== 'file') return;
+  const key = editor.document.uri.toString();
+  const ctx = tracedSelectionContextByEditorUri.get(key);
+  if (!ctx || !ctx.targets.length) {
+    vscode.window.showInformationMessage('No traced selection found in this file.');
+    return;
+  }
+  const anchor = editor.selection?.active;
+  if (!anchor || !ctx.range.contains(anchor)) {
+    vscode.window.showInformationMessage('Place cursor inside traced code section to revert.');
+    return;
+  }
+  for (const t of ctx.targets) {
+    await revertTraceReductionForNode(t.sourceJsonPath, t.routeId, t.nodeId);
+  }
+  tracedSelectionContextByEditorUri.delete(key);
+  if (tracedSelectionDecorationType) {
+    editor.setDecorations(tracedSelectionDecorationType, []);
+  }
+}
+
+async function revertTraceReductionForNode(
+  sourceJsonPath: string,
+  routeId: string,
+  nodeId: string
+): Promise<void> {
+  const key = traceReductionBackupKey(sourceJsonPath, routeId, nodeId);
+  const backup = traceReductionBackupByTarget.get(key);
+  if (!backup) {
+    vscode.window.showInformationMessage('No trace-reduction backup found for this node.');
+    return;
+  }
+  const existing = graphDataByJsonPath.get(sourceJsonPath);
+  if (!existing || !existing.graphSnapshots[routeId]) return;
+  existing.graphSnapshots[routeId] = JSON.parse(JSON.stringify(backup)) as GraphSnapshot;
+  graphDataByJsonPath.set(sourceJsonPath, existing);
+  traceReductionBackupByTarget.delete(key);
+  const msg: UpsertSessionMessage = {
+    type: 'upsertSession',
+    sourceJsonPath,
+    graphSnapshots: existing.graphSnapshots,
+    routeNames: existing.routeNames,
+    initialRouteId: routeId,
+    sessionMode: 'replace',
+    unsavedChanges: true,
+    mergeInPlace: true,
+  };
+  getGraphPanel()?.instance?.deliverUpsertExternal(msg);
+  getGraphPanel()?.instance?.postSessionState({ sourceJsonPath, unsavedChanges: true });
 }
 
 function focusCurrentFileInGraph(): void {
@@ -656,6 +1118,34 @@ function openFileInEditor(relativePath: string): void {
       }
     }
   );
+}
+
+function selectWorkspaceItemFromGraph(relativePath: string): void {
+  const trimmed = relativePath?.trim();
+  if (!trimmed) return;
+  const normalized = trimmed.replace(/^[/\\]+/, '');
+  let projectRoot: string | undefined;
+  if (lastJsonPath && fs.existsSync(lastJsonPath)) {
+    const jsonDir = path.dirname(lastJsonPath);
+    projectRoot = path.basename(jsonDir) === 'visualizer' ? path.dirname(jsonDir) : jsonDir;
+  }
+  if (!projectRoot && vscode.workspace.workspaceFolders?.length) {
+    projectRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+  }
+  if (!projectRoot) return;
+
+  let absPath = path.join(projectRoot, normalized);
+  if (!fs.existsSync(absPath) && vscode.workspace.workspaceFolders) {
+    for (const folder of vscode.workspace.workspaceFolders) {
+      const candidate = path.join(folder.uri.fsPath, normalized);
+      if (fs.existsSync(candidate)) {
+        absPath = candidate;
+        break;
+      }
+    }
+  }
+  if (!fs.existsSync(absPath)) return;
+  pushWorkspaceSelection(absPath, true);
 }
 
 function getPreferredProjectRoot(fsPath?: string): string | undefined {
@@ -944,10 +1434,13 @@ function autoDetectFileGraphs(context: vscode.ExtensionContext): void {
   context.subscriptions.push(fileGraphWatcher, filesNamedWatcher);
 }
 
-function graphPanelHooks() {
+function graphPanelHooks(context: vscode.ExtensionContext) {
   return {
     onBacktrack: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => {
       void runBacktrackFromWebview(payload.nodeId, payload.routeId, payload.sourceJsonPath);
+    },
+    onRevertTraceNode: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => {
+      void revertTraceReductionForNode(payload.sourceJsonPath, payload.routeId, payload.nodeId);
     },
     onSaveBacktrack: (sourceJsonPath: string) => {
       void saveBacktrackGraph(sourceJsonPath);
@@ -973,6 +1466,27 @@ function graphPanelHooks() {
     onAddRecentTreeDrag: (payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => {
       void addRecentTreeDraggedNodes(payload.routeId, payload.sourceJsonPath, payload.dropX, payload.dropY);
     },
+    onCreateEmptyGraph: () => {
+      void createAndOpenEmptyGraph(context, true);
+    },
+    onRenameSession: (payload: { sourceJsonPath: string; displayLabel: string }) => {
+      const label = String(payload.displayLabel || '').trim();
+      if (!label) return;
+      customSessionLabelsByPath.set(payload.sourceJsonPath, label);
+      getGraphPanel()?.instance?.postSessionState({
+        sourceJsonPath: payload.sourceJsonPath,
+        displayLabel: label,
+      });
+    },
+    onSearchWorkspaceFiles: (payload: { query: string; sourceJsonPath: string; requestToken: string }) => {
+      void searchWorkspaceFilesForGraph(payload.query, payload.sourceJsonPath, payload.requestToken);
+    },
+    onStartSidebarPlacement: (payload: { routeId: string; sourceJsonPath: string; dropX: number; dropY: number }) => {
+      pendingGraphPlacement = { ...payload };
+      void vscode.commands.executeCommand('workbench.view.extension.api-graph-sidebar');
+      void vscode.commands.executeCommand('apiGraphVisualizer.fileDropTree.focus');
+      searchSidebarProvider.activatePlacementSearch();
+    },
     onGraphDrop: (payload: {
       routeId: string;
       sourceJsonPath: string;
@@ -993,6 +1507,40 @@ function graphPanelHooks() {
       void saveSession(payload.sourceJsonPath, !!payload.saveToSaved, payload.graphSnapshots);
     },
   };
+}
+
+async function searchWorkspaceFilesForGraph(
+  query: string,
+  sourceJsonPath: string,
+  requestToken: string
+): Promise<void> {
+  const q = String(query || '').trim();
+  const tree = await buildWorkspaceTree({
+    query: q,
+    mode: 'files',
+    matchCase: false,
+    wholeWord: true,
+    useRegex: false,
+  });
+  const collectFiles = (nodes: SidebarTreeNode[], out: SidebarTreeNode[]): void => {
+    for (const node of nodes) {
+      if (node.type === 'file') out.push(node);
+      if (Array.isArray(node.children) && node.children.length) collectFiles(node.children, out);
+    }
+  };
+  const files: SidebarTreeNode[] = [];
+  collectFiles(tree, files);
+  const items = files.slice(0, 80).map((n) => ({
+    absPath: n.absPath,
+    relPath: n.relPath || relPathFromWorkspace(n.absPath),
+    label: n.label || path.basename(n.absPath),
+  }));
+  getGraphPanel()?.instance?.postWebviewMessage({
+    type: 'cmd:workspaceSearchResults',
+    sourceJsonPath,
+    requestToken,
+    items,
+  });
 }
 
 function makeManualNode(rel: string): GraphData['graphSnapshots'][string]['nodes'][number] {
@@ -1059,19 +1607,19 @@ async function addNodeFromGraphDrop(
   sourceJsonPath: string,
   dropX?: number,
   dropY?: number
-): Promise<void> {
+): Promise<boolean> {
   const graphData = graphDataByJsonPath.get(sourceJsonPath);
-  if (!graphData) return;
+  if (!graphData) return false;
   const snap = graphData.graphSnapshots[routeId];
-  if (!snap) return;
+  if (!snap) return false;
   const rel = toWorkspaceRelPathAny(droppedPath, sourceJsonPath);
   if (!rel) {
     vscode.window.showWarningMessage('Dropped file is outside the current workspace.');
-    return;
+    return false;
   }
   const normalizedRel = normalizeGraphNodePath(rel);
   if (snap.nodes.some((n) => normalizeGraphNodePath(String(n.id || '')) === normalizedRel)) {
-    return;
+    return false;
   }
   const node = makeManualNode(rel);
   if (typeof dropX === 'number' && typeof dropY === 'number') {
@@ -1087,6 +1635,7 @@ async function addNodeFromGraphDrop(
     routeId,
     node,
   });
+  return true;
 }
 
 async function addRecentTreeDraggedNodes(
@@ -1600,18 +2149,20 @@ async function loadAndShowFileGraph(
     await attachGitHeat(graphData, getGitRepoRootForPath(jsonPath));
 
     const hooks = {
-      ...graphPanelHooks(),
+      ...graphPanelHooks(context),
       ...(graphData.backtrack
         ? {
             initialSession: {
               isBacktrackSession: true as const,
               backtrackDirty: false as const,
-              displayLabel: `backtracked · ${path.basename(jsonPath)}`,
+              displayLabel:
+                customSessionLabelsByPath.get(jsonPath) ?? `backtracked · ${path.basename(jsonPath)}`,
               progressiveReveal: false as const,
             },
           }
         : {
             initialSession: {
+              displayLabel: customSessionLabelsByPath.get(jsonPath),
               progressiveReveal: false,
             },
           }),
@@ -1626,6 +2177,7 @@ async function loadAndShowFileGraph(
         if (!skipRestore) fileDropProvider.updateDroppedFiles(fileRoutes);
       },
       (filePath) => openFileInEditor(filePath),
+      (filePath) => selectWorkspaceItemFromGraph(filePath),
       fileRoute,
       jsonPath,
       mode,

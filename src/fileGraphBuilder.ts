@@ -128,12 +128,19 @@ interface FileNode {
   depth: number;
 }
 
+export interface BuildFileGraphOptions {
+  rootImportSpecs?: Set<string>;
+  routeNameSuffix?: string;
+  tracedSelectionLabel?: string;
+}
+
 async function buildFileNode(
   absPath: string,
   projectRoot: string,
   visited: Set<string>,
   useLlm: boolean,
-  depth: number
+  depth: number,
+  options?: BuildFileGraphOptions
 ): Promise<FileNode> {
   const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
   const fileDir = path.dirname(absPath);
@@ -155,7 +162,10 @@ async function buildFileNode(
     ? await getFileSummaryFromOllama(absPath, path.basename(absPath))
     : 'File dependency';
 
-  const allLocalSpecs = getAllLocalImportSpecsForGraph(absPath);
+  const allLocalSpecs =
+    depth === 0 && options?.rootImportSpecs && options.rootImportSpecs.size > 0
+      ? options.rootImportSpecs
+      : getAllLocalImportSpecsForGraph(absPath);
   const usedPackages = getUsedPackageSpecs(absPath);
   const packages = Array.from(usedPackages);
   const internalFiles: FileNode[] = [];
@@ -163,7 +173,7 @@ async function buildFileNode(
   for (const imp of allLocalSpecs) {
     const resolved = resolveImportSpecifier(fileDir, imp, projectRoot);
     if (resolved) {
-      internalFiles.push(await buildFileNode(resolved, projectRoot, visited, useLlm, depth + 1));
+      internalFiles.push(await buildFileNode(resolved, projectRoot, visited, useLlm, depth + 1, options));
     }
   }
 
@@ -180,7 +190,8 @@ async function buildFileNode(
 
 function fileNodeToGraphSnapshot(
   root: FileNode,
-  routeName: string
+  routeName: string,
+  options?: BuildFileGraphOptions
 ): GraphSnapshot {
   const nodes: NodeData[] = [];
   const edges: EdgeData[] = [];
@@ -192,10 +203,15 @@ function fileNodeToGraphSnapshot(
     seenNodes.add(node.relPath);
 
     const packagesStr = node.packages.length > 0 ? node.packages.join(', ') : 'None';
-    const tooltip = `${node.relPath}\n\nWhat it does:\n${node.summary}\n\nNPM Packages:\n${packagesStr}${node.isCircular ? '\n\n⚠ CIRCULAR' : ''}`;
+    const tracedRoot = isRoot && !!options?.rootImportSpecs;
+    const titlePrefix =
+      tracedRoot && options?.tracedSelectionLabel
+        ? `${options.tracedSelectionLabel}\n\n`
+        : '';
+    const tooltip = `${node.relPath}\n\n${titlePrefix}What it does:\n${node.summary}\n\nNPM Packages:\n${packagesStr}${node.isCircular ? '\n\n⚠ CIRCULAR' : ''}`;
 
-    const baseColor = node.isCircular ? '#E53935' : isRoot ? '#7B1FA2' : '#1E88E5';
-    const borderColor = node.isCircular ? '#B71C1C' : isRoot ? '#4A148C' : '#0D47A1';
+    const baseColor = node.isCircular ? '#E53935' : tracedRoot ? '#8E24AA' : isRoot ? '#7B1FA2' : '#1E88E5';
+    const borderColor = node.isCircular ? '#B71C1C' : tracedRoot ? '#F59E0B' : isRoot ? '#4A148C' : '#0D47A1';
 
     nodes.push({
       id: node.relPath,
@@ -209,9 +225,9 @@ function fileNodeToGraphSnapshot(
         hover: { background: '#42A5F5', border: '#FFC107' },
       },
       font: { color: '#ffffff', size: 18, face: 'Inter, -apple-system, sans-serif' },
-      shape: 'box',
+      shape: tracedRoot ? 'diamond' : 'box',
       size: isRoot ? 40 : 38,
-      borderWidth: 1.5,
+      borderWidth: tracedRoot ? 2.4 : 1.5,
       borderWidthSelected: 3,
       margin: 12,
       isController: isRoot,
@@ -270,17 +286,19 @@ function fileNodeToGraphSnapshot(
 export async function buildFileGraph(
   entryPath: string,
   projectRoot: string,
-  useLlm: boolean
+  useLlm: boolean,
+  options?: BuildFileGraphOptions
 ): Promise<GraphData> {
   const absPath = path.isAbsolute(entryPath) ? entryPath : path.join(projectRoot, entryPath);
   if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
     throw new Error(`File not found: ${entryPath}`);
   }
 
-  const root = await buildFileNode(absPath, projectRoot, new Set(), useLlm, 0);
+  const root = await buildFileNode(absPath, projectRoot, new Set(), useLlm, 0, options);
   const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
-  const routeName = `Import: ${relPath}`;
-  const snapshot = fileNodeToGraphSnapshot(root, routeName);
+  const suffix = options?.routeNameSuffix ? ` • ${options.routeNameSuffix}` : '';
+  const routeName = `Import: ${relPath}${suffix}`;
+  const snapshot = fileNodeToGraphSnapshot(root, routeName, options);
 
   return {
     graphSnapshots: { [routeName]: snapshot },

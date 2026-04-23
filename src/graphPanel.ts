@@ -28,6 +28,8 @@ export interface UpsertSessionMessage {
   displayLabel?: string;
   /** True = level-by-level reveal, false = load all at once. */
   progressiveReveal?: boolean;
+  /** If true, webview should start inline tab rename for this session. */
+  startRename?: boolean;
   /**
    * With sessionMode `replace` on the already-active tab: patch the current route in the webview
    * (add/remove nodes/edges to match JSON) without a full reload — preserves pan/zoom/selection.
@@ -55,7 +57,11 @@ export class GraphPanel {
   private disposables: vscode.Disposable[] = [];
   private onGraphMetaReady: ((routeNames: string[], nodeIds: string[], currentRouteId?: string) => void) | null = null;
   private onOpenFileFromGraph: ((filePath: string) => void) | null = null;
+  private onSelectFileInWorkspaceFromGraph: ((filePath: string) => void) | null = null;
   private onBacktrack:
+    | ((payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void)
+    | null = null;
+  private onRevertTraceNode:
     | ((payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void)
     | null = null;
   private onSaveBacktrack: ((sourceJsonPath: string) => void) | null = null;
@@ -71,6 +77,16 @@ export class GraphPanel {
     | null = null;
   private onAddRecentTreeDrag:
     | ((payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void)
+    | null = null;
+  private onCreateEmptyGraph: (() => void) | null = null;
+  private onRenameSession:
+    | ((payload: { sourceJsonPath: string; displayLabel: string }) => void)
+    | null = null;
+  private onSearchWorkspaceFiles:
+    | ((payload: { query: string; sourceJsonPath: string; requestToken: string }) => void)
+    | null = null;
+  private onStartSidebarPlacement:
+    | ((payload: { routeId: string; sourceJsonPath: string; dropX: number; dropY: number }) => void)
     | null = null;
   private onGraphDrop:
     | ((payload: {
@@ -96,11 +112,13 @@ export class GraphPanel {
     graphData: GraphData,
     onGraphMetaReady: (routeNames: string[], nodeIds: string[], currentRouteId?: string) => void,
     onOpenFileFromGraph: (filePath: string) => void,
+    onSelectFileInWorkspaceFromGraph: (filePath: string) => void,
     initialRouteId: string | undefined,
     sourceJsonPath: string,
     mode: GraphPanelLoadMode,
     hooks?: {
       onBacktrack?: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void;
+      onRevertTraceNode?: (payload: { nodeId: string; routeId: string; sourceJsonPath: string }) => void;
       onSaveBacktrack?: (sourceJsonPath: string) => void;
       onSaveBacktrackPrompt?: (sourceJsonPath: string) => void;
       onAddNodeFromDrop?: (payload: {
@@ -111,6 +129,10 @@ export class GraphPanel {
         dropY?: number;
       }) => void;
       onAddRecentTreeDrag?: (payload: { routeId: string; sourceJsonPath: string; dropX?: number; dropY?: number }) => void;
+      onCreateEmptyGraph?: () => void;
+      onRenameSession?: (payload: { sourceJsonPath: string; displayLabel: string }) => void;
+      onSearchWorkspaceFiles?: (payload: { query: string; sourceJsonPath: string; requestToken: string }) => void;
+      onStartSidebarPlacement?: (payload: { routeId: string; sourceJsonPath: string; dropX: number; dropY: number }) => void;
       onGraphDrop?: (payload: {
         routeId: string;
         sourceJsonPath: string;
@@ -126,6 +148,7 @@ export class GraphPanel {
         backtrackDirty?: boolean;
         displayLabel?: string;
         progressiveReveal?: boolean;
+        startRename?: boolean;
       };
     }
   ): GraphPanel {
@@ -144,6 +167,7 @@ export class GraphPanel {
       backtrackDirty: ini?.backtrackDirty ?? false,
       unsavedChanges: false,
       progressiveReveal: ini?.progressiveReveal ?? false,
+      startRename: ini?.startRename ?? false,
     };
     if (ini?.displayLabel !== undefined) {
       msg.displayLabel = ini.displayLabel;
@@ -152,11 +176,17 @@ export class GraphPanel {
     if (GraphPanel.instance) {
       GraphPanel.instance.onGraphMetaReady = onGraphMetaReady;
       GraphPanel.instance.onOpenFileFromGraph = onOpenFileFromGraph;
+      GraphPanel.instance.onSelectFileInWorkspaceFromGraph = onSelectFileInWorkspaceFromGraph;
       GraphPanel.instance.onBacktrack = hooks?.onBacktrack ?? null;
+      GraphPanel.instance.onRevertTraceNode = hooks?.onRevertTraceNode ?? null;
       GraphPanel.instance.onSaveBacktrack = hooks?.onSaveBacktrack ?? null;
       GraphPanel.instance.onSaveBacktrackPrompt = hooks?.onSaveBacktrackPrompt ?? null;
       GraphPanel.instance.onAddNodeFromDrop = hooks?.onAddNodeFromDrop ?? null;
       GraphPanel.instance.onAddRecentTreeDrag = hooks?.onAddRecentTreeDrag ?? null;
+      GraphPanel.instance.onCreateEmptyGraph = hooks?.onCreateEmptyGraph ?? null;
+      GraphPanel.instance.onRenameSession = hooks?.onRenameSession ?? null;
+      GraphPanel.instance.onSearchWorkspaceFiles = hooks?.onSearchWorkspaceFiles ?? null;
+      GraphPanel.instance.onStartSidebarPlacement = hooks?.onStartSidebarPlacement ?? null;
       GraphPanel.instance.onGraphDrop = hooks?.onGraphDrop ?? null;
       GraphPanel.instance.onConnectNodes = hooks?.onConnectNodes ?? null;
       GraphPanel.instance.onSaveSession = hooks?.onSaveSession ?? null;
@@ -189,11 +219,17 @@ export class GraphPanel {
       extensionUri,
       onGraphMetaReady,
       onOpenFileFromGraph,
+      onSelectFileInWorkspaceFromGraph,
       hooks?.onBacktrack ?? null,
+      hooks?.onRevertTraceNode ?? null,
       hooks?.onSaveBacktrack ?? null,
       hooks?.onSaveBacktrackPrompt ?? null,
       hooks?.onAddNodeFromDrop ?? null,
       hooks?.onAddRecentTreeDrag ?? null,
+      hooks?.onCreateEmptyGraph ?? null,
+      hooks?.onRenameSession ?? null,
+      hooks?.onSearchWorkspaceFiles ?? null,
+      hooks?.onStartSidebarPlacement ?? null,
       hooks?.onGraphDrop ?? null,
       hooks?.onConnectNodes ?? null,
       hooks?.onSaveSession ?? null,
@@ -208,11 +244,17 @@ export class GraphPanel {
     extensionUri: vscode.Uri,
     onGraphMetaReady: (routeNames: string[], nodeIds: string[], currentRouteId?: string) => void,
     onOpenFileFromGraph: (filePath: string) => void,
+    onSelectFileInWorkspaceFromGraph: (filePath: string) => void,
     onBacktrack: GraphPanel['onBacktrack'],
+    onRevertTraceNode: GraphPanel['onRevertTraceNode'],
     onSaveBacktrack: GraphPanel['onSaveBacktrack'],
     onSaveBacktrackPrompt: GraphPanel['onSaveBacktrackPrompt'],
     onAddNodeFromDrop: GraphPanel['onAddNodeFromDrop'],
     onAddRecentTreeDrag: GraphPanel['onAddRecentTreeDrag'],
+    onCreateEmptyGraph: GraphPanel['onCreateEmptyGraph'],
+    onRenameSession: GraphPanel['onRenameSession'],
+    onSearchWorkspaceFiles: GraphPanel['onSearchWorkspaceFiles'],
+    onStartSidebarPlacement: GraphPanel['onStartSidebarPlacement'],
     onGraphDrop: GraphPanel['onGraphDrop'],
     onConnectNodes: GraphPanel['onConnectNodes'],
     onSaveSession: GraphPanel['onSaveSession'],
@@ -222,11 +264,17 @@ export class GraphPanel {
     this.extensionUri = extensionUri;
     this.onGraphMetaReady = onGraphMetaReady;
     this.onOpenFileFromGraph = onOpenFileFromGraph;
+    this.onSelectFileInWorkspaceFromGraph = onSelectFileInWorkspaceFromGraph;
     this.onBacktrack = onBacktrack;
+    this.onRevertTraceNode = onRevertTraceNode;
     this.onSaveBacktrack = onSaveBacktrack;
     this.onSaveBacktrackPrompt = onSaveBacktrackPrompt;
     this.onAddNodeFromDrop = onAddNodeFromDrop;
     this.onAddRecentTreeDrag = onAddRecentTreeDrag;
+    this.onCreateEmptyGraph = onCreateEmptyGraph;
+    this.onRenameSession = onRenameSession;
+    this.onSearchWorkspaceFiles = onSearchWorkspaceFiles;
+    this.onStartSidebarPlacement = onStartSidebarPlacement;
     this.onGraphDrop = onGraphDrop;
     this.onConnectNodes = onConnectNodes;
     this.onSaveSession = onSaveSession;
@@ -255,6 +303,11 @@ export class GraphPanel {
               this.onOpenFileFromGraph(message.filePath as string);
             }
             break;
+          case 'cmd:selectInWorkspace':
+            if (this.onSelectFileInWorkspaceFromGraph && message.filePath) {
+              this.onSelectFileInWorkspaceFromGraph(message.filePath as string);
+            }
+            break;
           case 'cmd:backtrack':
             if (
               this.onBacktrack &&
@@ -262,6 +315,19 @@ export class GraphPanel {
               typeof message.sourceJsonPath === 'string'
             ) {
               this.onBacktrack({
+                nodeId: message.nodeId,
+                routeId: typeof message.routeId === 'string' ? message.routeId : '',
+                sourceJsonPath: message.sourceJsonPath,
+              });
+            }
+            break;
+          case 'cmd:revertTraceNode':
+            if (
+              this.onRevertTraceNode &&
+              typeof message.nodeId === 'string' &&
+              typeof message.sourceJsonPath === 'string'
+            ) {
+              this.onRevertTraceNode({
                 nodeId: message.nodeId,
                 routeId: typeof message.routeId === 'string' ? message.routeId : '',
                 sourceJsonPath: message.sourceJsonPath,
@@ -305,6 +371,51 @@ export class GraphPanel {
                 sourceJsonPath: message.sourceJsonPath,
                 dropX: typeof message.dropX === 'number' ? message.dropX : undefined,
                 dropY: typeof message.dropY === 'number' ? message.dropY : undefined,
+              });
+            }
+            break;
+          case 'cmd:createEmptyGraph':
+            if (this.onCreateEmptyGraph) this.onCreateEmptyGraph();
+            break;
+          case 'cmd:renameSession':
+            if (
+              this.onRenameSession &&
+              typeof message.sourceJsonPath === 'string' &&
+              typeof message.displayLabel === 'string'
+            ) {
+              this.onRenameSession({
+                sourceJsonPath: message.sourceJsonPath,
+                displayLabel: message.displayLabel,
+              });
+            }
+            break;
+          case 'cmd:searchWorkspaceFiles':
+            if (
+              this.onSearchWorkspaceFiles &&
+              typeof message.query === 'string' &&
+              typeof message.sourceJsonPath === 'string' &&
+              typeof message.requestToken === 'string'
+            ) {
+              this.onSearchWorkspaceFiles({
+                query: message.query,
+                sourceJsonPath: message.sourceJsonPath,
+                requestToken: message.requestToken,
+              });
+            }
+            break;
+          case 'cmd:startSidebarPlacement':
+            if (
+              this.onStartSidebarPlacement &&
+              typeof message.routeId === 'string' &&
+              typeof message.sourceJsonPath === 'string' &&
+              typeof message.dropX === 'number' &&
+              typeof message.dropY === 'number'
+            ) {
+              this.onStartSidebarPlacement({
+                routeId: message.routeId,
+                sourceJsonPath: message.sourceJsonPath,
+                dropX: message.dropX,
+                dropY: message.dropY,
               });
             }
             break;
@@ -504,6 +615,7 @@ export class GraphPanel {
     <div id="nodeInfoPath" class="node-info-path"></div>
     <div id="nodeInfoBody" class="node-info-body"></div>
     <button type="button" id="nodeInfoNext" class="node-info-next">Next</button>
+    <button type="button" id="nodeInfoRevert" class="node-info-next">Revert Trace</button>
   </div>
 
   <script nonce="${nonce}" src="${visNetworkUri}"></script>

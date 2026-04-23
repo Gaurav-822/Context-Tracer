@@ -35,6 +35,13 @@ export type SidebarSavedListMessage = {
   type: 'savedListUpdate';
   saved: { label: string; absPath: string; relPath: string }[];
 };
+export type SidebarWorkspaceSelectionMessage = {
+  type: 'workspaceSelectionUpdate';
+  absPath: string;
+};
+export type SidebarActivatePlacementMessage = {
+  type: 'activatePlacement';
+};
 
 type OpenRequestMessage = {
   type: 'openResult';
@@ -55,9 +62,14 @@ type ToggleLlmMessage = { type: 'toggleLlm' };
 type OpenSavedMessage = { type: 'openSaved'; absPath: string };
 type OpenSavedSaveAsMessage = { type: 'openSavedSaveAs'; absPath: string };
 type SavedGraphSaveInPlaceMessage = { type: 'savedGraphSaveInPlace'; absPath: string };
+type RenameWorkspaceItemMessage = { type: 'renameWorkspaceItem'; absPath: string };
 type CreateFileMessage = { type: 'createFile' };
 type CreateFolderMessage = { type: 'createFolder' };
+type CreateEmptyGraphMessage = { type: 'createEmptyGraph' };
 type SidebarDragPathsMessage = { type: 'sidebarDragPaths'; paths: string[] };
+type UndoWorkspaceRevealMessage = { type: 'undoWorkspaceReveal' };
+type PlaceInGraphMessage = { type: 'placeInGraph'; absPath: string };
+type CancelPlaceInGraphMessage = { type: 'cancelPlaceInGraph' };
 
 export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
@@ -81,8 +93,13 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       onSaveSavedGraphCopyAs: (absPath: string) => Promise<void>;
       /** Sidebar floating menu: overwrite this JSON from Map View (or open then prompt). */
       onSavedGraphSaveInPlace: (absPath: string) => Promise<void>;
+      onRenameWorkspaceItem: (absPath: string) => Promise<void>;
+      onCreateEmptyGraph: () => Promise<void>;
       onCreateFile: () => Promise<void>;
       onCreateFolder: () => Promise<void>;
+      onUndoWorkspaceReveal: () => Promise<void>;
+      onPlaceInGraph: (absPath: string) => Promise<void>;
+      onCancelPlaceInGraph: () => Promise<void>;
       /** Snapshot of visualizer/backtracked JSON list (no workspace tree rebuild). */
       listSavedGraphsForSidebar: () => { label: string; absPath: string; relPath: string }[];
     }
@@ -96,6 +113,22 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       type: 'savedListUpdate',
       saved,
     };
+    void this.view.webview.postMessage(msg);
+  }
+
+  postWorkspaceSelection(absPath: string): void {
+    if (!this.view) return;
+    const msg: SidebarWorkspaceSelectionMessage = {
+      type: 'workspaceSelectionUpdate',
+      absPath,
+    };
+    void this.view.webview.postMessage(msg);
+  }
+
+  activatePlacementSearch(): void {
+    if (!this.view) return;
+    const msg: SidebarActivatePlacementMessage = { type: 'activatePlacement' };
+    void this.view.show?.(true);
     void this.view.webview.postMessage(msg);
   }
 
@@ -120,9 +153,14 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         | OpenSavedMessage
         | OpenSavedSaveAsMessage
         | SavedGraphSaveInPlaceMessage
+        | RenameWorkspaceItemMessage
+        | CreateEmptyGraphMessage
         | CreateFileMessage
         | CreateFolderMessage
         | SidebarDragPathsMessage
+        | UndoWorkspaceRevealMessage
+        | PlaceInGraphMessage
+        | CancelPlaceInGraphMessage
         | { type: 'ready' };
       if (!msg || typeof msg !== 'object' || !('type' in msg)) return;
 
@@ -165,6 +203,16 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         await this.hooks.onSavedGraphSaveInPlace(msg.absPath);
         return;
       }
+      if (msg.type === 'renameWorkspaceItem') {
+        await this.hooks.onRenameWorkspaceItem(msg.absPath);
+        const panel = await this.hooks.onRequestPanelData({});
+        void webview.postMessage({ type: 'panelData', panel });
+        return;
+      }
+      if (msg.type === 'createEmptyGraph') {
+        await this.hooks.onCreateEmptyGraph();
+        return;
+      }
       if (msg.type === 'createFile') {
         await this.hooks.onCreateFile();
         const panel = await this.hooks.onRequestPanelData({});
@@ -177,8 +225,20 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         void webview.postMessage({ type: 'panelData', panel });
         return;
       }
+      if (msg.type === 'undoWorkspaceReveal') {
+        await this.hooks.onUndoWorkspaceReveal();
+        return;
+      }
       if (msg.type === 'openResult') {
         await this.hooks.onOpenResult({ resultType: msg.resultType, absPath: msg.absPath });
+        return;
+      }
+      if (msg.type === 'placeInGraph') {
+        await this.hooks.onPlaceInGraph(msg.absPath);
+        return;
+      }
+      if (msg.type === 'cancelPlaceInGraph') {
+        await this.hooks.onCancelPlaceInGraph();
       }
     });
   }
@@ -290,6 +350,32 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       gap: 6px;
       margin-top: 10px;
     }
+    .workspaceHeader {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      margin-top: 10px;
+      margin-left: -8px;
+      margin-right: -8px;
+      padding: 6px 8px;
+      background: var(--vscode-editor-background, var(--vscode-sideBar-background));
+      border-top: 1px solid transparent;
+      border-bottom: 1px solid transparent;
+      transition:
+        background-color 180ms ease,
+        border-color 180ms ease,
+        box-shadow 180ms ease,
+        padding-top 180ms ease,
+        padding-bottom 180ms ease;
+    }
+    body.wsScrolled .workspaceHeader {
+      padding-top: 4px;
+      padding-bottom: 4px;
+      background: color-mix(in srgb, var(--vscode-editor-background, var(--vscode-sideBar-background)) 92%, var(--vscode-list-hoverBackground) 8%);
+      border-top-color: var(--vscode-panel-border);
+      border-bottom-color: var(--vscode-panel-border);
+      box-shadow: 0 1px 0 0 var(--vscode-panel-border);
+    }
     .sectionHeader .sectionTitle {
       margin: 0;
     }
@@ -387,6 +473,18 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
     }
     .treeRow:hover {
       background: var(--vscode-list-hoverBackground);
+    }
+    .treeRow.active {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+      color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+      outline: 1px solid var(--vscode-focusBorder, transparent);
+      outline-offset: -1px;
+    }
+    .treeRow.kbdActive {
+      background: var(--vscode-list-hoverBackground, rgba(88,166,255,0.16));
+      color: var(--vscode-foreground);
+      outline: 1px solid var(--vscode-focusBorder, rgba(88,166,255,0.45));
+      outline-offset: -1px;
     }
     .twisty {
       width: 12px;
@@ -513,9 +611,12 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
   <div class="hint">Filter the workspace: <strong>File</strong> = filenames only; <strong>Folder</strong> = folder paths. With <strong>ab</strong> off, matches use word chunks (camelCase, separators). Click a file to build the graph.</div>
   <div class="sectionTitle" style="margin-top:10px;">Features</div>
   <div id="features" class="treeWrap"></div>
-  <div class="sectionHeader">
+  <div class="sectionHeader workspaceHeader">
     <div class="sectionTitle">Workspace</div>
     <div class="workspaceActions">
+      <button id="wsNewGraph" type="button" class="wsActionBtn" title="Create Empty Graph" data-tip="Create Empty Graph" aria-label="Create Empty Graph">
+        <svg viewBox="0 0 16 16"><path d="M3 2.5h10v11H3z"/><path d="M8 5v6M5 8h6"/></svg>
+      </button>
       <button id="wsNewFile" type="button" class="wsActionBtn" title="Create New File" data-tip="Create New File" aria-label="Create New File">
         <svg viewBox="0 0 16 16"><path d="M3 1.5h6l3.5 3.5V14.5H3z"/><path d="M9 1.5V5h3.5"/><path d="M8 8v4M6 10h4"/></svg>
       </button>
@@ -528,6 +629,9 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       <button id="wsCollapseAll" type="button" class="wsActionBtn" title="Collapse to top level or expand all folders" data-tip="Collapse to top level or expand all folders" aria-label="Collapse or expand all workspace folders">
         <svg viewBox="0 0 16 16"><path d="M3 3.5h10"/><path d="M3 8h10"/><path d="M3 12.5h10"/><path d="M6 5.2 4.2 3.5 6 1.8"/><path d="M10 10.8 11.8 12.5 10 14.2"/></svg>
       </button>
+      <button id="wsUndoReveal" type="button" class="wsActionBtn" title="Undo previous workspace selection" data-tip="Undo previous workspace selection" aria-label="Undo previous workspace selection">
+        <svg viewBox="0 0 16 16"><path d="M6 4 2.5 7.5 6 11"/><path d="M3 7.5h5.2a4.3 4.3 0 1 1 0 8.6"/></svg>
+      </button>
     </div>
   </div>
   <div id="tree" class="treeWrap workspaceBody"></div>
@@ -538,6 +642,10 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
     <button type="button" role="menuitem" data-action="open">Open in Map View</button>
     <button type="button" role="menuitem" data-action="save">Save</button>
     <button type="button" role="menuitem" data-action="saveAs">Save copy as…</button>
+  </div>
+  <div id="workspaceFloatingMenu" class="saved-floating-menu" role="menu" aria-hidden="true">
+    <div id="workspaceFloatingMenuTitle" class="saved-menu-title"></div>
+    <button type="button" role="menuitem" data-action="rename">Rename</button>
   </div>
 
   <script nonce="${nonce}">
@@ -555,13 +663,18 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       const savedFloatingMenuTitleEl = document.getElementById('savedFloatingMenuTitle');
       const savedCountEl = document.getElementById('savedCount');
       const treeEl = document.getElementById('tree');
+      const wsNewGraphEl = document.getElementById('wsNewGraph');
       const wsNewFileEl = document.getElementById('wsNewFile');
       const wsNewFolderEl = document.getElementById('wsNewFolder');
       const wsRefreshEl = document.getElementById('wsRefresh');
       const wsCollapseAllEl = document.getElementById('wsCollapseAll');
+      const wsUndoRevealEl = document.getElementById('wsUndoReveal');
+      const workspaceFloatingMenuEl = document.getElementById('workspaceFloatingMenu');
+      const workspaceFloatingMenuTitleEl = document.getElementById('workspaceFloatingMenuTitle');
       let toggleLlmEl = null;
       let llmSubEl = null;
       const expandedFolderState = new Map();
+      let selectedWorkspacePath = '';
       let hadActiveSearch = false;
       let searchDebounceTimer = null;
       const SEARCH_DEBOUNCE_MS = 280;
@@ -571,12 +684,22 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       let wholeWord = true;
       let useRegex = false;
       let savedMenuAbsPath = null;
+      let workspaceMenuAbsPath = null;
+      let placementMode = false;
+      let workspaceKeyboardIndex = -1;
 
       function hideSavedFloatingMenu() {
         if (!savedFloatingMenuEl) return;
         savedFloatingMenuEl.classList.remove('visible');
         savedFloatingMenuEl.setAttribute('aria-hidden', 'true');
         savedMenuAbsPath = null;
+      }
+
+      function hideWorkspaceFloatingMenu() {
+        if (!workspaceFloatingMenuEl) return;
+        workspaceFloatingMenuEl.classList.remove('visible');
+        workspaceFloatingMenuEl.setAttribute('aria-hidden', 'true');
+        workspaceMenuAbsPath = null;
       }
 
       function showSavedFloatingMenu(clientX, clientY, absPath, label) {
@@ -598,6 +721,28 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           if (top + rect.height > vh - pad) top = Math.max(pad, vh - rect.height - pad);
           savedFloatingMenuEl.style.left = left + 'px';
           savedFloatingMenuEl.style.top = top + 'px';
+        });
+      }
+
+      function showWorkspaceFloatingMenu(clientX, clientY, absPath, label) {
+        if (!workspaceFloatingMenuEl) return;
+        workspaceMenuAbsPath = absPath;
+        if (workspaceFloatingMenuTitleEl) {
+          workspaceFloatingMenuTitleEl.textContent = label || absPath.split(/[/\\\\]/).pop() || absPath;
+        }
+        workspaceFloatingMenuEl.classList.add('visible');
+        workspaceFloatingMenuEl.setAttribute('aria-hidden', 'false');
+        requestAnimationFrame(() => {
+          const pad = 8;
+          const rect = workspaceFloatingMenuEl.getBoundingClientRect();
+          const vw = window.innerWidth;
+          const vh = window.innerHeight;
+          let left = clientX;
+          let top = clientY;
+          if (left + rect.width > vw - pad) left = Math.max(pad, vw - rect.width - pad);
+          if (top + rect.height > vh - pad) top = Math.max(pad, vh - rect.height - pad);
+          workspaceFloatingMenuEl.style.left = left + 'px';
+          workspaceFloatingMenuEl.style.top = top + 'px';
         });
       }
 
@@ -625,6 +770,30 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         );
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape') hideSavedFloatingMenu();
+        });
+      }
+      if (workspaceFloatingMenuEl) {
+        workspaceFloatingMenuEl.querySelectorAll('button[data-action]').forEach((btn) => {
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const absPath = workspaceMenuAbsPath;
+            const action = btn.getAttribute('data-action');
+            hideWorkspaceFloatingMenu();
+            if (!absPath || !action) return;
+            if (action === 'rename') vscode.postMessage({ type: 'renameWorkspaceItem', absPath });
+          });
+        });
+        document.addEventListener(
+          'mousedown',
+          (e) => {
+            if (!workspaceFloatingMenuEl.classList.contains('visible')) return;
+            if (workspaceFloatingMenuEl.contains(e.target)) return;
+            hideWorkspaceFloatingMenu();
+          },
+          true
+        );
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') hideWorkspaceFloatingMenu();
         });
       }
 
@@ -732,7 +901,79 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         }, SEARCH_DEBOUNCE_MS);
       }
 
+      let wsScrollRaf = null;
+      function updateWorkspaceHeaderScrollState() {
+        const y = window.scrollY || document.documentElement.scrollTop || 0;
+        document.body.classList.toggle('wsScrolled', y > 24);
+      }
+      function scheduleWorkspaceHeaderScrollState() {
+        if (wsScrollRaf) cancelAnimationFrame(wsScrollRaf);
+        wsScrollRaf = requestAnimationFrame(() => {
+          wsScrollRaf = null;
+          updateWorkspaceHeaderScrollState();
+        });
+      }
+
+      function workspaceFileRows() {
+        return Array.from(treeEl.querySelectorAll('button.treeRow .icon.fileIcon'))
+          .map((icon) => icon.closest('button.treeRow'))
+          .filter(Boolean);
+      }
+
+      function clearWorkspaceKeyboardSelection() {
+        treeEl.querySelectorAll('button.treeRow.kbdActive').forEach((row) => row.classList.remove('kbdActive'));
+      }
+
+      function applyWorkspaceKeyboardSelection(idx) {
+        const rows = workspaceFileRows();
+        clearWorkspaceKeyboardSelection();
+        if (!rows.length) {
+          workspaceKeyboardIndex = -1;
+          return;
+        }
+        const n = rows.length;
+        workspaceKeyboardIndex = ((idx % n) + n) % n;
+        const row = rows[workspaceKeyboardIndex];
+        if (!row) return;
+        row.classList.add('kbdActive');
+        row.scrollIntoView({ block: 'nearest' });
+      }
+
+      function placeKeyboardSelectedFile() {
+        const rows = workspaceFileRows();
+        if (!rows.length) return false;
+        if (workspaceKeyboardIndex < 0 || workspaceKeyboardIndex >= rows.length) {
+          applyWorkspaceKeyboardSelection(0);
+        }
+        const row = rows[workspaceKeyboardIndex];
+        const absPath = row && row.getAttribute('data-abs-path');
+        if (!absPath) return false;
+        vscode.postMessage({ type: 'placeInGraph', absPath });
+        placementMode = false;
+        clearWorkspaceKeyboardSelection();
+        workspaceKeyboardIndex = -1;
+        queryEl.value = '';
+        return true;
+      }
+
       queryEl.addEventListener('keydown', (e) => {
+        if (placementMode && e.key === 'Escape') {
+          e.preventDefault();
+          placementMode = false;
+          clearWorkspaceKeyboardSelection();
+          workspaceKeyboardIndex = -1;
+          vscode.postMessage({ type: 'cancelPlaceInGraph' });
+          return;
+        }
+        if (placementMode && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+          e.preventDefault();
+          applyWorkspaceKeyboardSelection(workspaceKeyboardIndex + (e.key === 'ArrowDown' ? 1 : -1));
+          return;
+        }
+        if (placementMode && e.key === 'Enter') {
+          e.preventDefault();
+          if (placeKeyboardSelectedFile()) return;
+        }
         if (e.key === 'Enter') {
           if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
           searchDebounceTimer = null;
@@ -751,10 +992,12 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       }
       modeFilesEl.addEventListener('click', () => setMode('files'));
       modeFoldersEl.addEventListener('click', () => setMode('folders'));
+      wsNewGraphEl.addEventListener('click', () => vscode.postMessage({ type: 'createEmptyGraph' }));
       wsNewFileEl.addEventListener('click', () => vscode.postMessage({ type: 'createFile' }));
       wsNewFolderEl.addEventListener('click', () => vscode.postMessage({ type: 'createFolder' }));
       wsRefreshEl.addEventListener('click', () => doSearch());
       wsCollapseAllEl.addEventListener('click', () => toggleWorkspaceTreeExpandCollapse());
+      wsUndoRevealEl.addEventListener('click', () => vscode.postMessage({ type: 'undoWorkspaceReveal' }));
       function setToolState(el, on) { el.classList.toggle('active', on); }
       toolCaseEl.addEventListener('click', () => {
         matchCase = !matchCase;
@@ -771,6 +1014,8 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         setToolState(toolRegexEl, useRegex);
         doSearch();
       });
+      window.addEventListener('scroll', scheduleWorkspaceHeaderScrollState, { passive: true });
+      updateWorkspaceHeaderScrollState();
 
       window.addEventListener('message', (event) => {
         const msg = event.data || {};
@@ -780,6 +1025,24 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         }
         if (msg.type === 'savedListUpdate') {
           renderSavedList(msg.saved);
+          return;
+        }
+        if (msg.type === 'workspaceSelectionUpdate') {
+          selectedWorkspacePath = String(msg.absPath || '');
+          revealSelectedInWorkspaceTree();
+          return;
+        }
+        if (msg.type === 'activatePlacement') {
+          placementMode = true;
+          workspaceKeyboardIndex = -1;
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          queryEl.focus();
+          queryEl.select();
+          if (currentMode !== 'files') setMode('files');
+          else doSearch();
+          setTimeout(() => {
+            applyWorkspaceKeyboardSelection(0);
+          }, 140);
           return;
         }
         if (msg.type === 'panelData') {
@@ -817,6 +1080,10 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           ul.className = 'treeList';
           for (const n of nodes) ul.appendChild(renderNode(n, 0, true));
           treeEl.appendChild(ul);
+          if (placementMode) {
+            applyWorkspaceKeyboardSelection(workspaceKeyboardIndex >= 0 ? workspaceKeyboardIndex : 0);
+          }
+          revealSelectedInWorkspaceTree();
           if (currentMode === 'files' && currentQueryText) {
             requestAnimationFrame(function () {
               const hit = treeEl.querySelector('button.treeRow .icon.fileIcon');
@@ -870,6 +1137,43 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         syncFolderTwistiesFromDom();
       }
 
+      function updateWorkspaceSelectionStyles() {
+        treeEl.querySelectorAll('button.treeRow.active').forEach((el) => el.classList.remove('active'));
+        if (!selectedWorkspacePath) return;
+        treeEl.querySelectorAll('button.treeRow[data-abs-path]').forEach((el) => {
+          if (el.getAttribute('data-abs-path') === selectedWorkspacePath) {
+            el.classList.add('active');
+          }
+        });
+      }
+
+      function revealSelectedInWorkspaceTree() {
+        if (!selectedWorkspacePath) return;
+        let target = null;
+        treeEl.querySelectorAll('button.treeRow[data-abs-path]').forEach((el) => {
+          if (!target && el.getAttribute('data-abs-path') === selectedWorkspacePath) {
+            target = el;
+          }
+        });
+        if (!target) return;
+        let cursor = target.parentElement;
+        while (cursor && cursor !== treeEl) {
+          if (cursor.tagName === 'UL' && cursor.classList.contains('children')) {
+            cursor.classList.remove('hidden');
+            const parentRow = cursor.previousElementSibling;
+            if (parentRow && parentRow.classList.contains('treeRow')) {
+              const twisty = parentRow.querySelector('.twisty');
+              if (twisty) twisty.textContent = '▾';
+              const key = String(parentRow.getAttribute('data-folder-key') || '');
+              if (key) expandedFolderState.set(key, true);
+            }
+          }
+          cursor = cursor.parentElement;
+        }
+        updateWorkspaceSelectionStyles();
+        target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+
       function renderNode(node, depth, isRoot) {
         const li = document.createElement('li');
         li.className = 'treeItem';
@@ -883,6 +1187,7 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           row.setAttribute('data-folder-key', key);
           row.setAttribute('data-folder-depth', String(depth));
           row.title = node.relPath || node.absPath;
+          row.setAttribute('data-abs-path', node.absPath);
 
           const twisty = document.createElement('span');
           twisty.className = 'twisty';
@@ -908,18 +1213,28 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           row.appendChild(twisty);
           row.appendChild(icon);
           row.appendChild(name);
+          if (selectedWorkspacePath && node.absPath === selectedWorkspacePath) {
+            row.classList.add('active');
+          }
 
           li.appendChild(row);
 
-          if (hasChildren) {
-            const childList = document.createElement('ul');
-            childList.className = 'children' + (isExpanded ? '' : ' hidden');
-            for (const c of children) childList.appendChild(renderNode(c, depth + 1, false));
-            row.addEventListener('click', () => {
+          row.addEventListener('click', () => {
+            selectedWorkspacePath = node.absPath;
+            updateWorkspaceSelectionStyles();
+            if (hasChildren) {
               const nowHidden = childList.classList.toggle('hidden');
               twisty.textContent = nowHidden ? '▸' : '▾';
               expandedFolderState.set(key, !nowHidden);
-            });
+            }
+            vscode.postMessage({ type: 'openResult', resultType: 'folder', absPath: node.absPath });
+          });
+
+          let childList = null;
+          if (hasChildren) {
+            childList = document.createElement('ul');
+            childList.className = 'children' + (isExpanded ? '' : ' hidden');
+            for (const c of children) childList.appendChild(renderNode(c, depth + 1, false));
             li.appendChild(childList);
           }
           return li;
@@ -930,9 +1245,21 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         row.className = 'treeRow';
         row.style.paddingLeft = pad + 'px';
         row.title = node.relPath;
+        row.setAttribute('data-abs-path', node.absPath);
         row.innerHTML = '<span class="twisty"></span><span class="icon fileIcon"></span><span class="name"></span>';
         row.querySelector('.name').textContent = node.label;
+        if (selectedWorkspacePath && node.absPath === selectedWorkspacePath) {
+          row.classList.add('active');
+        }
+        row.addEventListener('contextmenu', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          hideSavedFloatingMenu();
+          showWorkspaceFloatingMenu(ev.clientX, ev.clientY, node.absPath, node.label);
+        });
         row.addEventListener('click', () => {
+          selectedWorkspacePath = node.absPath;
+          updateWorkspaceSelectionStyles();
           vscode.postMessage({ type: 'openResult', resultType: 'file', absPath: node.absPath });
         });
         bindDragFileSource(row, node.absPath);

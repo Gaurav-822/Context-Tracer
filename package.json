@@ -29,6 +29,16 @@
         "icon": "$(graph)"
       },
       {
+        "command": "apiGraphVisualizer.traceFromSelection",
+        "title": "Trace from here",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "apiGraphVisualizer.revertTraceFromSelection",
+        "title": "Revert Trace Here",
+        "icon": "$(discard)"
+      },
+      {
         "command": "apiGraphVisualizer.buildFromResource",
         "title": "File Graph: Build Import Graph",
         "icon": "$(graph)"
@@ -116,6 +126,23 @@
           "command": "apiGraphVisualizer.buildFromCurrentFile",
           "when": "editorTextFocus",
           "group": "2_editor"
+        },
+        {
+          "command": "apiGraphVisualizer.traceFromSelection",
+          "when": "editorHasSelection && editorTextFocus",
+          "group": "2_editor"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "apiGraphVisualizer.traceFromSelection",
+          "when": "editorHasSelection && editorTextFocus && (resourceExtname == '.ts' || resourceExtname == '.tsx' || resourceExtname == '.js' || resourceExtname == '.jsx' || resourceExtname == '.mjs' || resourceExtname == '.cjs')",
+          "group": "navigation"
+        },
+        {
+          "command": "apiGraphVisualizer.revertTraceFromSelection",
+          "when": "editorTextFocus && (resourceExtname == '.ts' || resourceExtname == '.tsx' || resourceExtname == '.js' || resourceExtname == '.jsx' || resourceExtname == '.mjs' || resourceExtname == '.cjs')",
+          "group": "navigation@1"
         }
       ],
       "view/title": [

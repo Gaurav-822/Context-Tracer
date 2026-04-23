@@ -60,6 +60,64 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.graph-tab-input {
+  min-width: 0;
+  width: 140px;
+  max-width: 180px;
+  border: 1px solid rgba(88,166,255,0.45);
+  border-radius: 4px;
+  background: rgba(13,17,23,0.95);
+  color: #e6edf3;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+.graph-tab-input:focus {
+  border-color: #58a6ff;
+  box-shadow: 0 0 0 1px rgba(88,166,255,0.25);
+}
+.graph-tab-add {
+  width: 28px;
+  justify-content: center;
+  padding: 4px 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+}
+.graph-tab-floating-menu {
+  position: fixed;
+  z-index: 3500;
+  min-width: 140px;
+  padding: 4px 0;
+  margin: 0;
+  display: none;
+  background: #161b22;
+  color: #c9d1d9;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+}
+.graph-tab-floating-menu.visible {
+  display: block;
+}
+.graph-tab-floating-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 12px;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.graph-tab-floating-menu button:hover {
+  background: rgba(88,166,255,0.2);
+  color: #e6edf3;
+}
 .graph-tab:hover {
   background: rgba(255,255,255,0.08);
   color: #c9d1d9;
@@ -366,6 +424,57 @@ body {
   pointer-events: none;
   z-index: 1003;
   box-sizing: border-box;
+}
+
+#graph-placement-search {
+  position: fixed;
+  z-index: 4600;
+  width: min(520px, calc(100vw - 24px));
+  display: none;
+  background: #161b22;
+  border: 1px solid rgba(88,166,255,0.4);
+  border-radius: 10px;
+  box-shadow: 0 16px 30px rgba(0,0,0,0.45);
+  overflow: hidden;
+}
+#graph-placement-search.visible {
+  display: block;
+}
+#graph-placement-search .gps-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  outline: none;
+  padding: 11px 12px;
+  background: #0d1117;
+  color: #e6edf3;
+  font: 12px 'Inter', -apple-system, sans-serif;
+}
+#graph-placement-search .gps-list {
+  max-height: 240px;
+  overflow: auto;
+}
+#graph-placement-search .gps-item {
+  padding: 8px 12px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  color: #c9d1d9;
+  font-size: 12px;
+  cursor: pointer;
+}
+#graph-placement-search .gps-item small {
+  display: block;
+  color: #8b949e;
+  margin-top: 2px;
+}
+#graph-placement-search .gps-item.active {
+  background: rgba(88,166,255,0.18);
+  color: #e6edf3;
+}
+#graph-placement-search .gps-empty {
+  padding: 10px 12px;
+  color: #8b949e;
+  font-size: 12px;
+  border-top: 1px solid rgba(255,255,255,0.06);
 }
 
 #dragHelp {

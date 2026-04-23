@@ -69,10 +69,16 @@ function getUsedSpecsRegex(
 }
 
 /** Collect all identifier names used in the AST, excluding import declarations. */
-function collectUsedIdentifiers(sourceFile: ts.SourceFile): Set<string> {
+function collectUsedIdentifiers(
+  sourceFile: ts.SourceFile,
+  range?: { start: number; end: number }
+): Set<string> {
   const used = new Set<string>();
 
   function visit(node: ts.Node) {
+    if (range) {
+      if (node.getEnd() <= range.start || node.getStart(sourceFile, false) >= range.end) return;
+    }
     if (ts.isImportDeclaration(node)) return; // skip entire import - its ids are declarations, not uses
     if (ts.isImportClause(node)) return; // part of import
     if (ts.isImportSpecifier(node)) return;
@@ -126,7 +132,8 @@ function getImportSpecsFromAst(sourceFile: ts.SourceFile): Array<{ spec: string;
 function getUsedSpecsFromAst(
   content: string,
   filter: (spec: string) => boolean,
-  scriptKind: ts.ScriptKind = ts.ScriptKind.TS
+  scriptKind: ts.ScriptKind = ts.ScriptKind.TS,
+  range?: { start: number; end: number }
 ): Set<string> | null {
   try {
     const sourceFile = ts.createSourceFile(
@@ -137,7 +144,7 @@ function getUsedSpecsFromAst(
       scriptKind
     );
 
-    const used = collectUsedIdentifiers(sourceFile);
+    const used = collectUsedIdentifiers(sourceFile, range);
     const importSpecs = getImportSpecsFromAst(sourceFile);
     const result = new Set<string>();
 
@@ -271,6 +278,36 @@ export function getUsedLocalImportSpecs(filePath: string): Set<string> {
       return astResult;
     }
     return getUsedSpecsRegex(content, filter);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Return local import specs used inside a selected text range (offsets in file content). */
+export function getUsedLocalImportSpecsInRange(
+  filePath: string,
+  startOffset: number,
+  endOffset: number
+): Set<string> {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const start = Math.max(0, Math.min(startOffset, content.length));
+    const end = Math.max(start, Math.min(endOffset, content.length));
+    const filter = (s: string) => s.startsWith('.') || s.startsWith('/') || s.startsWith('@/') || s.startsWith('~/');
+    const astResult = getUsedSpecsFromAst(content, filter, getScriptKind(filePath), { start, end });
+    if (astResult !== null) {
+      mergeRequireUsed(content.slice(start, end), astResult, filter);
+      return astResult;
+    }
+    const selected = content.slice(start, end);
+    const importMap = extractImportMap(content);
+    const usedIdents = getIdentifiersUsedInCode(selected, importMap);
+    const usedSpecs = new Set<string>();
+    for (const ident of usedIdents) {
+      const spec = importMap.get(ident);
+      if (spec && filter(spec)) usedSpecs.add(spec);
+    }
+    return usedSpecs;
   } catch {
     return new Set();
   }
