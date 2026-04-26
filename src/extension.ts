@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { FileDropTreeProvider, relPathFromWorkspaceTreeId, scanSavedBacktrackedJson, toFileNamedBasename } from './fileDropTree';
 import type { GraphData, GraphSnapshot } from './types';
@@ -130,26 +131,56 @@ const MD_FEATURE_FILES = new Set([
   'working.md',
 ]);
 
+/** Keep in sync with `MCP_WANTED_STATE_KEY` in mcpConfig.ts (lazy-loaded). */
+const EXPLORER_MAP_MCP_WANTED_STATE_KEY = 'apiGraphVisualizer.explorerMapMcp.wantsOn.v1';
+
+/** Best-effort: open Cursor/VS Code UI where the user can enable MCP servers and per-server tools. */
+async function openCursorMcpSettingsPage(): Promise<void> {
+  const tryCmd = async (id: string, ...args: unknown[]) => {
+    try {
+      await vscode.commands.executeCommand(id, ...args);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (await tryCmd('workbench.action.openSettings', 'MCP')) {
+    return;
+  }
+  if (await tryCmd('workbench.action.openSettings', 'mcp')) {
+    return;
+  }
+  if (await tryCmd('workbench.view.extension.mcp.view')) {
+    return;
+  }
+  await tryCmd('workbench.action.openGlobalSettings');
+  void vscode.window.showInformationMessage(
+    'In Cursor, open **Cursor Settings** → **Tools & MCP** (or search “MCP” in settings). Turn **on** the Explorer Map server and each of its tools, then **fully quit and restart** Cursor, and start a **new** chat so tools from this server appear (GitKraken, Sentry, etc. can use up the tool budget).'
+  );
+}
+
 function getMcpDisabledSnapshot(context: vscode.ExtensionContext) {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  const mcpC = vscode.workspace.getConfiguration('apiGraphVisualizer.mcp');
+  const mcpWanted = context.workspaceState.get<boolean | undefined>(EXPLORER_MAP_MCP_WANTED_STATE_KEY) !== false;
   return {
     serverKey: 'explorer-map-md',
     distPath: path.join(context.extensionPath, 'dist', 'mcp-md-handler', 'index.js'),
     distExists: false,
     workspaceRoot,
-    showRunnerTerminal: true,
-    runInProjectTerminal: true,
+    showRunnerTerminal: mcpC.get<boolean>('showRunnerTerminal', false) === true,
+    runInProjectTerminal: mcpC.get<boolean>('runInProjectTerminal', false) === true,
     nodeCommand: 'node',
     nodeResolved: 'node',
-    writeGlobalMcp: false,
+    writeGlobalMcp: mcpC.get<boolean>('writeGlobalMcp', false) === true,
     mcpUseProgrammaticMcp: false,
-    mcpWanted: false,
-    mcpServerActive: false,
+    mcpWanted,
+    mcpServerActive: mcpWanted && !!workspaceRoot,
     mcpRegisteredInProject: false,
     mcpRegisteredInGlobal: false,
-    mcpEnabledAnywhere: false,
+    mcpEnabledAnywhere: mcpWanted,
     projectMcpJsonPath: workspaceRoot ? path.join(workspaceRoot, '.cursor', 'mcp.json') : null,
-    globalMcpJsonPath: '',
+    globalMcpJsonPath: path.join(os.homedir(), '.cursor', 'mcp.json'),
     jsonConfig: '{}',
   };
 }
@@ -378,10 +409,32 @@ export function activate(context: vscode.ExtensionContext) {
     },
   });
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchSidebarProvider));
+
+  void lazyMcpConfig()
+    .then(async (mcp) => {
+      mcp.registerExplorerMapMcpLayer(context);
+      await mcp.applyExplorerMapMcpProjectSync(context);
+      searchSidebarProvider?.postMcpPanelSnapshot(await getMcpSnapshotIfLoaded(context));
+    })
+    .catch((e) => {
+      const message = e instanceof Error ? e.stack || e.message : String(e);
+      log.appendLine(`[mcp bootstrap] ${message}`);
+    });
+
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('apiGraphVisualizer.mcp')) {
-        searchSidebarProvider?.postMcpPanelSnapshot(getMcpDisabledSnapshot(context));
+        void (async () => {
+          try {
+            const mcp = await lazyMcpConfig();
+            await mcp.applyExplorerMapMcpProjectSync(context);
+          } catch (err) {
+            const message = err instanceof Error ? err.stack || err.message : String(err);
+            log.appendLine(`[mcp config] ${message}`);
+          }
+          const snap = await getMcpSnapshotIfLoaded(context);
+          searchSidebarProvider?.postMcpPanelSnapshot(snap);
+        })();
       }
     })
   );
@@ -416,6 +469,12 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.copyMcpServerConfig', () => {
       void withMcpLayer(context, log, (mcp) => mcp.copyCursorMcpConfigToClipboard(context));
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.copyMcpStdioTestCommand', () => {
+      void withMcpLayer(context, log, (mcp) => mcp.copyMcpStdioTestCommandToClipboard(context));
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.openCursorMcpSettings', () => {
+      void openCursorMcpSettingsPage();
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.openMcpReadme', () => {
       void withMcpLayer(context, log, (mcp) => mcp.openMcpReadme(context));

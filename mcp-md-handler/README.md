@@ -73,20 +73,16 @@ When the extension is installed from a VSIX, get the path to the bundled `mcp-md
 
 ## Agent does not list Explorer Map MCP tools?
 
-The **Chat / Agent** only sees tools for MCP servers that **Cursor** starts from your **`mcp.json`**. The Explorer Map **“Open MCP server in terminal”** button is for **debug only**; it does **not** connect that process to the Agent.
+The **Chat / Agent** only gets tools for MCP servers that **Cursor** has enabled for that session. The project **`mcp.json`** is not always enough: you must **turn the server and its tools on** in Cursor, then often **fully restart** and use a **new** chat. See [Cursor’s MCP overview](https://cursor.com/docs/mcp).
 
-Do this if the **Explorer Map checkmark** did not register the server (e.g. you need the JSON for another machine):
+1. In **Explorer Map → mcp**, use **“Open Cursor Tools & MCP settings”** (or Command Palette: **Explorer Map: Open Cursor Tools & MCP settings**). Enable the **`explorer-map-md-…` server** and **each tool** (read / graph).  
+2. **Fully quit and restart Cursor** (reload is sometimes not enough).  
+3. Open a **new** Agent / chat.  
+4. In chat, have the model call **`explorer_map_workspace_status` first** — it always returns project JSON if the process started; that confirms the stdio server is the right one. If that tool is also missing, the server is not connected to the Agent (settings / restart / tool limit).  
+5. **Tool budget**: with GitKraken, Sentry, and others, Cursor may not expose every tool from every server. Temporarily **disable** other MCP servers, then start a new chat, to verify Explorer Map tools.  
+6. If the **Explorer Map** checkmark in the sidebar did not write config: use **Copy Cursor MCP config** and merge into **`.cursor/mcp.json`**, with absolute **`node`** (see `apiGraphVisualizer.mcp.nodeExecutable` if `node` is not on Cursor’s `PATH`).
 
-1. Prefer the checkmark, or **Copy Cursor MCP config** in Explorer Map → Features → MCP.
-2. Save into **`~/.cursor/mcp.json`** and/or **`<your-workspace>/.cursor/mcp.json`** as needed.
-3. In **Cursor → Settings → MCP**, make sure the **`explorer-map-md` server is enabled** (toggle on).
-4. **Fully quit and restart Cursor** (reload window is sometimes not enough for MCP to pick up changes).
-5. Open a **new** Agent / chat that supports tools.
-6. If the server still fails, open **Output** and select **MCP** (or similar) in the dropdown and read the error. Common issues:
-   - **`node` not found**: Cursor’s environment may not see nvm. In VS Code/Explorer Map settings, set **`apiGraphVisualizer.mcp.nodeExecutable`** to the full path from `which node` (or e.g. `/opt/homebrew/bin/node` on macOS), then **Copy** the config again.
-   - **Invalid JSON**: a trailing comma or bad merge can make Cursor ignore the whole file.
-   - **Many MCP servers**: Cursor can hit a high tool count; try temporarily **disabling** other servers to confirm `explorer-map-md` loads.
-   - **Browser / other tool names**: the Agent not listing `browser_tabs` is a **different** server (`cursor-ide-browser`); enable that server in MCP settings separately.
+**Debug-only:** “Open MCP server in terminal” does **not** wire that process to the Agent.
 
 ## Notes
 

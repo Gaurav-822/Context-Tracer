@@ -26,6 +26,8 @@
     "onCommand:apiGraphVisualizer.restoreFromBuildFromFile",
     "onCommand:apiGraphVisualizer.openBacktrackedGraphsFolder",
     "onCommand:apiGraphVisualizer.copyMcpServerConfig",
+    "onCommand:apiGraphVisualizer.copyMcpStdioTestCommand",
+    "onCommand:apiGraphVisualizer.openCursorMcpSettings",
     "onCommand:apiGraphVisualizer.openMcpReadme"
   ],
   "main": "./dist/extension.js",
@@ -93,6 +95,14 @@
       {
         "command": "apiGraphVisualizer.copyMcpServerConfig",
         "title": "Explorer Map: Copy Cursor MCP config (md handler)"
+      },
+      {
+        "command": "apiGraphVisualizer.copyMcpStdioTestCommand",
+        "title": "Explorer Map: (Advanced) Copy optional terminal debug command for MCP"
+      },
+      {
+        "command": "apiGraphVisualizer.openCursorMcpSettings",
+        "title": "Explorer Map: Open Cursor Tools & MCP settings"
       },
       {
         "command": "apiGraphVisualizer.openMcpReadme",
@@ -213,18 +223,18 @@
         },
         "apiGraphVisualizer.mcp.showRunnerTerminal": {
           "type": "boolean",
-          "default": true,
-          "description": "Show “Open MCP server in terminal” in Explorer Map → Features. Set false to hide (Cursor still runs MCP from its own config)."
+          "default": false,
+          "description": "Show “Open MCP server in terminal” in Explorer Map → Features. Off by default so the stdio server is not associated with a visible terminal tab (per-project `cwd` and `.cursor/mcp.json` are unchanged)."
         },
         "apiGraphVisualizer.mcp.nodeExecutable": {
           "type": "string",
           "default": "node",
-          "description": "Node binary used in the copied Cursor MCP `command` field. If the Agent never lists `read_md_handler_file`, set this to the full path from `which node` (Cursor often does not load nvm from your shell)."
+          "description": "Node for `.cursor/mcp.json` `command`. The extension resolves this to an **absolute** path (Homebrew /usr paths, then `which`) so the Agent can spawn MCP without your shell PATH. If the Agent still omits Explorer Map tools, set this explicitly to the full path from `which node` (e.g. /opt/homebrew/bin/node)."
         },
         "apiGraphVisualizer.mcp.runInProjectTerminal": {
           "type": "boolean",
-          "default": true,
-          "description": "Run the Explorer Map MCP process in a dedicated integrated terminal (cwd = this workspace). Recommended so each project uses its own folder and the server is not started as a hidden background process. Set false to use a headless process instead (same machine; still not shared across machines)."
+          "default": false,
+          "description": "Optional: run a **second** local Node process in an integrated terminal for debugging. Leave off for normal use — Cursor already spawns the MCP server from `.cursor/mcp.json` when the Explorer Map switch is on (see https://cursor.com/docs/mcp)."
         },
         "apiGraphVisualizer.mcp.writeGlobalMcp": {
           "type": "boolean",
@@ -243,6 +253,7 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
+    "test:mcp": "node scripts/test-mcp-stdio.js",
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {

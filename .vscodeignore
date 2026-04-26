@@ -1,7 +1,7 @@
 .vscode/**
 node_modules/**
-mcp-md-handler/node_modules/**
-mcp-md-handler/src/**
+# Runtime uses only the copy under dist/mcp-md-handler/ (produced by npm run build).
+mcp-md-handler/**
 src/**
 tsconfig.json
 esbuild.js

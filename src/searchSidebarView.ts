@@ -1,3 +1,4 @@
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { McpPanelSnapshot } from './mcpConfig';
@@ -173,24 +174,26 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
   }
 
   private fallbackMcpSnapshot(): McpPanelSnapshot {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+    const mcpC = vscode.workspace.getConfiguration('apiGraphVisualizer.mcp');
     return {
       serverKey: 'explorer-map-md',
       distPath: '',
       distExists: false,
-      workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
-      showRunnerTerminal: false,
-      runInProjectTerminal: true,
+      workspaceRoot: root,
+      showRunnerTerminal: mcpC.get<boolean>('showRunnerTerminal', false) === true,
+      runInProjectTerminal: mcpC.get<boolean>('runInProjectTerminal', false) === true,
       nodeCommand: 'node',
       nodeResolved: 'node',
-      writeGlobalMcp: false,
+      writeGlobalMcp: mcpC.get<boolean>('writeGlobalMcp', false) === true,
       mcpUseProgrammaticMcp: false,
-      mcpWanted: false,
-      mcpServerActive: false,
+      mcpWanted: true,
+      mcpServerActive: !!root,
       mcpRegisteredInProject: false,
       mcpRegisteredInGlobal: false,
-      mcpEnabledAnywhere: false,
-      projectMcpJsonPath: null,
-      globalMcpJsonPath: '',
+      mcpEnabledAnywhere: true,
+      projectMcpJsonPath: root ? path.join(root, '.cursor', 'mcp.json') : null,
+      globalMcpJsonPath: path.join(os.homedir(), '.cursor', 'mcp.json'),
       jsonConfig: '{}',
     };
   }
@@ -1099,6 +1102,11 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         }
 
         toolsRoot.appendChild(th);
+        addMcpToolBlock(
+          'explorer_map_workspace_status',
+          '**Use first:** JSON with workspace root, which md/ files exist, backtracked count, and steps if tools are missing in chat (Settings → Tools & MCP).',
+          false
+        );
         addMcpToolBlock(
           'read_md_handler_file',
           'Read the full UTF-8 text of one Markdown file under the workspace md/ folder (via the Agent or MCP client).',

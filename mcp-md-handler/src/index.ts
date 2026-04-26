@@ -120,10 +120,10 @@ async function persistBacktrackedJson(
 }
 
 const server = new McpServer(
-  { name: 'explorer-map-md-handler', version: '0.3.0' },
+  { name: 'explorer-map-md-handler', version: '0.3.1' },
   {
     instructions:
-      'Explorer Map MCP: read_md_handler_file. Two graph writers—do not confuse them: (1) **write_flow_file_graph** (preferred for code flows) uses **filePath** = repo-relative file path, **order** = step sequence, **fileName** / **role** = labels. Put step position in **order**, never a digit string in **filePath**; this is *not* the same as the other tool’s `id` field. (2) **write_workflow_graph** (advanced) uses **steps** { **id**, label, detail? } where **id** is only the graph’s internal node key (edges reference these strings); using "1", "2", "3" as **id** is a normal shortcut for unique keys, **not** a file system address. For file-at-a-time flows, prefer **write_flow_file_graph**. Map View when openInMap is true (default) on the file-flow tool.',
+      'Explorer Map MCP: **Start with explorer_map_workspace_status** to confirm the workspace and env, then **read_md_handler_file** for md/ notes. Two graph writers: (1) **write_flow_file_graph** — **filePath** = repo-relative path, **order** = step sequence. (2) **write_workflow_graph** — **steps** { **id**, label, detail? } where **id** is graph key only. If the Agent says this server is not connected, the user should enable the server and its tools under Cursor **Settings → Tools & MCP**, fully restart Cursor, and start a new chat; **explorer_map_workspace_status** still works when the process is up.',
   }
 );
 
@@ -138,11 +138,81 @@ function requireRoot(): { root: string } | { isError: true; text: string } {
   return { root };
 }
 
+const MD_HANDLER_BASENAMES = [
+  'skills.md',
+  'learnings.md',
+  'architecture.md',
+  'mistakes.md',
+  'working.md',
+] as const;
+
+server.registerTool(
+  'explorer_map_workspace_status',
+  {
+    description:
+      '**Use first** in any Agent turn: returns JSON with EXPLORER_MAP_WORKSPACE_ROOT, which `md/*.md` notes exist, and `visualizer/backtracked/`. Confirms the MCP process is the correct project. If the Agent does not list other Explorer Map tools, tell the user to enable this server in Cursor **Settings → Tools & MCP** (turn on the server and its tool toggles), quit and restart Cursor, and start a new chat; many servers (GitKraken, Sentry, etc.) can push Explorer Map tools off the available list until some are disabled.',
+    inputSchema: z.object({}),
+  },
+  async () => {
+    const r = requireRoot();
+    if ('isError' in r) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({ ok: false, error: r.text, fixEnv: 'Set EXPLORER_MAP_WORKSPACE_ROOT in mcp.json env for this stdio server.' }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const { root } = r;
+    const mdDir = path.join(root, 'md');
+    const details: { file: string; exists: boolean; bytes?: number }[] = [];
+    for (const f of MD_HANDLER_BASENAMES) {
+      const p = path.join(mdDir, f);
+      try {
+        const st = await fs.stat(p);
+        details.push({ file: f, exists: true, bytes: st.size });
+      } catch {
+        details.push({ file: f, exists: false });
+      }
+    }
+    const bt = backtrackedDir(root);
+    let backtrackedDirExists = false;
+    let backtrackedFileCount = 0;
+    try {
+      const entries = await fs.readdir(bt, { withFileTypes: true });
+      backtrackedDirExists = true;
+      backtrackedFileCount = entries.filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.json')).length;
+    } catch {
+      /* dir missing is ok */
+    }
+    const payload = {
+      ok: true,
+      server: 'explorer-map-md-handler',
+      version: '0.3.1',
+      workspaceRoot: root,
+      mdDirectory: mdDir,
+      mdFiles: details,
+      visualizerBacktrackedDir: bt,
+      backtrackedDirExists,
+      backtrackedJsonFileCount: backtrackedFileCount,
+      nextSteps: [
+        'To read a note: call read_md_handler_file with fileName (e.g. skills.md).',
+        'To build a file flow graph: call write_flow_file_graph with title and files [{ order, fileName, filePath, role }].',
+        'If tools from this server are missing in chat: Cursor Settings → Tools & MCP → enable this server and its tools → restart Cursor → new chat. Reduce other MCP servers if you hit a tool limit.',
+      ],
+    };
+    return { content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }] };
+  }
+);
+
 server.registerTool(
   'read_md_handler_file',
   {
     description:
-      'Read the full UTF-8 text of one Markdown file from the workspace `md/` folder (skills, learnings, architecture, mistakes, working).',
+      'Read the full UTF-8 text of one Markdown file from the workspace `md/` folder (skills, learnings, architecture, mistakes, working). Call **explorer_map_workspace_status** first if you need to confirm paths or which files exist.',
     inputSchema: z.object({
       fileName: fileNameSchema.describe('Which md handler file to read (basename under md/).'),
     }),
