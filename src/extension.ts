@@ -10,19 +10,6 @@ import {
   relPathFromWorkspace,
 } from './searchSidebarView';
 import { getUsedLocalImportSpecsInRange } from './usedImports';
-import { registerExplorerMapMcpDefinitionProvider } from './explorerMapMcpProvider';
-import {
-  getMcpPanelSnapshot,
-  provideExplorerMapMcpDefinitions,
-  syncProgrammaticMcpStateWithLegacyFiles,
-  copyCursorMcpConfigToClipboard,
-  openMcpReadme,
-  revealMcpHandlerFolderInOs,
-  openMcpRunnerTerminal,
-  initMcpRunnerTerminalReaper,
-  setExplorerMapMcpEnabled,
-} from './mcpConfig';
-import { registerMcpOpenMapFileWatcher } from './mcpOpenMapBridge';
 
 // Heavy modules loaded lazily on first use (keeps activation instant).
 async function lazyGraphPanel() { return import('./graphPanel'); }
@@ -30,6 +17,11 @@ async function lazyFileGraphBuilder() { return import('./fileGraphBuilder'); }
 async function lazyBacktrackClosure() { return import('./backtrackClosure'); }
 async function lazyBacktrackMerge() { return import('./backtrackMerge'); }
 async function lazyGitHeat() { return import('./gitHeat'); }
+let mcpConfigModulePromise: Promise<typeof import('./mcpConfig')> | undefined;
+async function lazyMcpConfig() {
+  mcpConfigModulePromise ??= import('./mcpConfig');
+  return mcpConfigModulePromise;
+}
 
 let _GraphPanel: typeof import('./graphPanel').GraphPanel | undefined;
 function getGraphPanel(): typeof import('./graphPanel').GraphPanel | undefined {
@@ -138,6 +130,57 @@ const MD_FEATURE_FILES = new Set([
   'working.md',
 ]);
 
+function getMcpDisabledSnapshot(context: vscode.ExtensionContext) {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  return {
+    serverKey: 'explorer-map-md',
+    distPath: path.join(context.extensionPath, 'dist', 'mcp-md-handler', 'index.js'),
+    distExists: false,
+    workspaceRoot,
+    showRunnerTerminal: true,
+    runInProjectTerminal: true,
+    nodeCommand: 'node',
+    nodeResolved: 'node',
+    writeGlobalMcp: false,
+    mcpUseProgrammaticMcp: false,
+    mcpWanted: false,
+    mcpServerActive: false,
+    mcpRegisteredInProject: false,
+    mcpRegisteredInGlobal: false,
+    mcpEnabledAnywhere: false,
+    projectMcpJsonPath: workspaceRoot ? path.join(workspaceRoot, '.cursor', 'mcp.json') : null,
+    globalMcpJsonPath: '',
+    jsonConfig: '{}',
+  };
+}
+
+async function getMcpSnapshotIfLoaded(context: vscode.ExtensionContext) {
+  if (!mcpConfigModulePromise) return getMcpDisabledSnapshot(context);
+  try {
+    const mcp = await mcpConfigModulePromise;
+    return mcp.getMcpPanelSnapshot(context);
+  } catch {
+    return getMcpDisabledSnapshot(context);
+  }
+}
+
+async function withMcpLayer<T>(
+  context: vscode.ExtensionContext,
+  log: vscode.OutputChannel,
+  fn: (mcp: typeof import('./mcpConfig')) => Promise<T> | T
+): Promise<T | undefined> {
+  try {
+    const mcp = await lazyMcpConfig();
+    mcp.registerExplorerMapMcpLayer(context);
+    return await fn(mcp);
+  } catch (err) {
+    const message = err instanceof Error ? err.stack || err.message : String(err);
+    log.appendLine(`[mcp] ${message}`);
+    void vscode.window.showErrorMessage('Explorer Map MCP failed. Core Explorer Map features are still available.');
+    return undefined;
+  }
+}
+
 async function readOrCreateWorkspaceMd(extensionUri: vscode.Uri, workspaceRoot: vscode.Uri, fileName: string): Promise<string> {
   if (!MD_FEATURE_FILES.has(fileName)) return '';
   const mdDir = vscode.Uri.joinPath(workspaceRoot, 'md');
@@ -244,9 +287,9 @@ function applyTraceSelectionDecoration(
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  initMcpRunnerTerminalReaper(context);
-  registerExplorerMapMcpDefinitionProvider(context, () => provideExplorerMapMcpDefinitions(context));
-  void syncProgrammaticMcpStateWithLegacyFiles(context);
+  const log = vscode.window.createOutputChannel('Explorer Map');
+  context.subscriptions.push(log);
+  try {
   fileDropProvider = new FileDropTreeProvider(context);
   searchSidebarProvider = new SearchSidebarViewProvider(context.extensionUri, {
     listSavedGraphsForSidebar: () => listSavedGraphs(),
@@ -266,7 +309,7 @@ export function activate(context: vscode.ExtensionContext) {
       useLlm: fileDropProvider.useLlm,
       saved: listSavedGraphs(),
       tree: await buildWorkspaceTree(params),
-      mcp: getMcpPanelSnapshot(context),
+      mcp: await getMcpSnapshotIfLoaded(context),
     }),
     onToggleLlm: async () => {
       fileDropProvider.toggleUseLlm();
@@ -309,28 +352,36 @@ export function activate(context: vscode.ExtensionContext) {
     onOpenMdDoc: async (fileName: string) => {
       await openWorkspaceMdDocFromSidebar(context, fileName);
     },
-    onMcpCopyConfig: () => copyCursorMcpConfigToClipboard(context),
-    onMcpRevealMcpHandler: () => revealMcpHandlerFolderInOs(context),
-    onMcpOpenReadme: () => openMcpReadme(context),
+    onMcpCopyConfig: async () => {
+      await withMcpLayer(context, log, (mcp) => mcp.copyCursorMcpConfigToClipboard(context));
+    },
+    onMcpRevealMcpHandler: async () => {
+      await withMcpLayer(context, log, (mcp) => mcp.revealMcpHandlerFolderInOs(context));
+    },
+    onMcpOpenReadme: async () => {
+      await withMcpLayer(context, log, (mcp) => mcp.openMcpReadme(context));
+    },
     onMcpOpenRunnerTerminal: async () => {
-      openMcpRunnerTerminal(
-        context,
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null
+      await withMcpLayer(context, log, (mcp) =>
+        mcp.openMcpRunnerTerminal(
+          context,
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null
+        )
       );
     },
     onMcpSetEnabled: async (enabled) => {
-      try {
-        await setExplorerMapMcpEnabled(context, enabled);
-      } finally {
-        searchSidebarProvider?.postMcpPanelSnapshot(getMcpPanelSnapshot(context));
-      }
+      const snap = await withMcpLayer(context, log, async (mcp) => {
+        await mcp.setExplorerMapMcpEnabled(context, enabled);
+        return mcp.getMcpPanelSnapshot(context);
+      });
+      searchSidebarProvider?.postMcpPanelSnapshot(snap ?? getMcpDisabledSnapshot(context));
     },
   });
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchSidebarProvider));
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('apiGraphVisualizer.mcp')) {
-        searchSidebarProvider?.postMcpPanelSnapshot(getMcpPanelSnapshot(context));
+        searchSidebarProvider?.postMcpPanelSnapshot(getMcpDisabledSnapshot(context));
       }
     })
   );
@@ -364,10 +415,10 @@ export function activate(context: vscode.ExtensionContext) {
       fileDropProvider.toggleUseLlm();
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.copyMcpServerConfig', () => {
-      void copyCursorMcpConfigToClipboard(context);
+      void withMcpLayer(context, log, (mcp) => mcp.copyCursorMcpConfigToClipboard(context));
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.openMcpReadme', () => {
-      void openMcpReadme(context);
+      void withMcpLayer(context, log, (mcp) => mcp.openMcpReadme(context));
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.openBacktrackedGraphsFolder', async () => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -477,12 +528,12 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  registerMcpOpenMapFileWatcher(context, async (absPath) => {
-    await loadAndShowFileGraph(context, absPath, 'newWindow');
-    getGraphPanel()?.instance?.reveal();
-  });
-
   // Graph opens only from this extension's actions (tree click/commands), not Explorer/editor focus.
+  } catch (err) {
+    const message = err instanceof Error ? err.stack || err.message : String(err);
+    log.appendLine(`[activate] failed: ${message}`);
+    void vscode.window.showErrorMessage('Explorer Map failed to activate. Check "Output: Explorer Map".');
+  }
 }
 
 async function createWorkspaceFile(): Promise<void> {
@@ -2342,4 +2393,10 @@ async function loadAndShowFileGraph(
   }
 }
 
-export function deactivate() {}
+export function deactivate() {
+  if (mcpConfigModulePromise) {
+    void mcpConfigModulePromise.then((mcp) => mcp.stopAllMcpRunners(), () => {
+      /* MCP layer was never fully loaded. */
+    });
+  }
+}

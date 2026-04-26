@@ -21,27 +21,61 @@ function copyScripts() {
   }
 }
 
+function copyMcpBundleArtifacts() {
+  const mcpDistSrc = path.join(__dirname, 'mcp-md-handler', 'dist', 'index.js');
+  const mcpReadmeSrc = path.join(__dirname, 'mcp-md-handler', 'README.md');
+  const mcpDistDestDir = path.join(__dirname, 'dist', 'mcp-md-handler');
+  if (!fs.existsSync(mcpDistSrc)) {
+    throw new Error('Missing mcp-md-handler/dist/index.js. Run mcp-md-handler build first.');
+  }
+  fs.mkdirSync(mcpDistDestDir, { recursive: true });
+  fs.copyFileSync(mcpDistSrc, path.join(mcpDistDestDir, 'index.js'));
+  if (fs.existsSync(mcpReadmeSrc)) {
+    fs.copyFileSync(mcpReadmeSrc, path.join(mcpDistDestDir, 'README.md'));
+  }
+}
+
 async function main() {
+  // Always build MCP server first, then bundle extension and copy artifacts into dist/.
+  await esbuild.context({
+    entryPoints: [path.join(__dirname, 'mcp-md-handler', 'src', 'index.ts')],
+    bundle: true,
+    platform: 'node',
+    target: 'node18',
+    format: 'cjs',
+    outfile: path.join(__dirname, 'mcp-md-handler', 'dist', 'index.js'),
+    sourcemap: !production,
+    logLevel: 'silent',
+  }).then(async (mcpCtx) => {
+    await mcpCtx.rebuild();
+    await mcpCtx.dispose();
+  });
+
   const ctx = await esbuild.context({
     entryPoints: ['src/extension.ts'],
     bundle: true,
     format: 'cjs',
-    minify: production,
+    // Keep extension host code unminified to avoid packaged-only runtime regressions.
+    minify: false,
     sourcemap: !production,
     sourcesContent: false,
     platform: 'node',
     outfile: 'dist/extension.js',
-    external: ['vscode', 'typescript'],
+    // Only `vscode` is provided by the host; everything else (incl. typescript)
+    // must be bundled because the packaged VSIX does not ship node_modules.
+    external: ['vscode'],
     logLevel: 'silent',
   });
   if (watch) {
     await ctx.watch();
     copyScripts();
+    copyMcpBundleArtifacts();
     console.log('Watching for changes...');
   } else {
     await ctx.rebuild();
     await ctx.dispose();
     copyScripts();
+    copyMcpBundleArtifacts();
     console.log('Build complete.');
   }
 }

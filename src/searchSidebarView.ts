@@ -88,6 +88,7 @@ type McpSetEnabledMessage = { type: 'mcpSetEnabled'; enabled: boolean };
 
 export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
+  private readonly log = vscode.window.createOutputChannel('Explorer Map');
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -171,6 +172,59 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
     void this.view.webview.postMessage({ type: 'mcpUpdate', mcp });
   }
 
+  private fallbackMcpSnapshot(): McpPanelSnapshot {
+    return {
+      serverKey: 'explorer-map-md',
+      distPath: '',
+      distExists: false,
+      workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+      showRunnerTerminal: false,
+      runInProjectTerminal: true,
+      nodeCommand: 'node',
+      nodeResolved: 'node',
+      writeGlobalMcp: false,
+      mcpUseProgrammaticMcp: false,
+      mcpWanted: false,
+      mcpServerActive: false,
+      mcpRegisteredInProject: false,
+      mcpRegisteredInGlobal: false,
+      mcpEnabledAnywhere: false,
+      projectMcpJsonPath: null,
+      globalMcpJsonPath: '',
+      jsonConfig: '{}',
+    };
+  }
+
+  private fallbackPanelData(): SidebarPanelData {
+    return {
+      useLlm: false,
+      saved: this.hooks.listSavedGraphsForSidebar(),
+      tree: [],
+      mcp: this.fallbackMcpSnapshot(),
+    };
+  }
+
+  private async postPanelDataSafe(
+    webview: vscode.Webview,
+    params: {
+      query?: string;
+      mode?: 'files' | 'folders';
+      matchCase?: boolean;
+      wholeWord?: boolean;
+      useRegex?: boolean;
+    }
+  ): Promise<void> {
+    try {
+      const panel = await this.hooks.onRequestPanelData(params);
+      void webview.postMessage({ type: 'panelData', panel });
+    } catch (err) {
+      const message = err instanceof Error ? err.stack || err.message : String(err);
+      this.log.appendLine(`[sidebar] requestPanelData failed: ${message}`);
+      void webview.postMessage({ type: 'panelData', panel: this.fallbackPanelData() });
+      void webview.postMessage({ type: 'panelError', message: 'Explorer Map recovered from an internal error. Open "Output: Explorer Map" for details.' });
+    }
+  }
+
   resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
@@ -216,19 +270,17 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (msg.type === 'ready') {
-        const panel = await this.hooks.onRequestPanelData({});
-        void webview.postMessage({ type: 'panelData', panel });
+        await this.postPanelDataSafe(webview, {});
         return;
       }
       if (msg.type === 'requestPanelData') {
-        const panel = await this.hooks.onRequestPanelData({
+        await this.postPanelDataSafe(webview, {
           query: msg.query,
           mode: msg.mode,
           matchCase: !!msg.matchCase,
           wholeWord: !!msg.wholeWord,
           useRegex: !!msg.useRegex,
         });
-        void webview.postMessage({ type: 'panelData', panel });
         return;
       }
       if (msg.type === 'openSaved') {
@@ -879,6 +931,13 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       const wsUndoRevealEl = document.getElementById('wsUndoReveal');
       const workspaceFloatingMenuEl = document.getElementById('workspaceFloatingMenu');
       const workspaceFloatingMenuTitleEl = document.getElementById('workspaceFloatingMenuTitle');
+      const errorBannerEl = document.createElement('div');
+      errorBannerEl.className = 'empty';
+      errorBannerEl.style.display = 'none';
+      errorBannerEl.style.marginTop = '0';
+      errorBannerEl.style.marginBottom = '8px';
+      errorBannerEl.style.color = 'var(--vscode-errorForeground)';
+      document.body.insertBefore(errorBannerEl, document.body.firstChild);
       const expandedFolderState = new Map();
       let selectedWorkspacePath = '';
       let hadActiveSearch = false;
@@ -1493,6 +1552,7 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         if (msg.type === 'panelData') {
+          errorBannerEl.style.display = 'none';
           const panel = msg.panel || {};
           if (currentQueryText.length > 0) {
             hadActiveSearch = true;
@@ -1534,6 +1594,11 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
               }
             });
           }
+        }
+        if (msg.type === 'panelError') {
+          errorBannerEl.textContent = String(msg.message || 'Explorer Map hit an internal error.');
+          errorBannerEl.style.display = 'block';
+          return;
         }
       });
 

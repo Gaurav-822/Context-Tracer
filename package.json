@@ -10,6 +10,24 @@
   "categories": [
     "Visualization"
   ],
+  "activationEvents": [
+    "onView:apiGraphVisualizer.fileDropTree",
+    "onCommand:apiGraphVisualizer.open",
+    "onCommand:apiGraphVisualizer.focusInGraph",
+    "onCommand:apiGraphVisualizer.buildFromCurrentFile",
+    "onCommand:apiGraphVisualizer.traceFromSelection",
+    "onCommand:apiGraphVisualizer.revertTraceFromSelection",
+    "onCommand:apiGraphVisualizer.buildFromResource",
+    "onCommand:apiGraphVisualizer.pickFileForGraph",
+    "onCommand:apiGraphVisualizer.loadImportRoute",
+    "onCommand:apiGraphVisualizer.toggleFileGraphLlm",
+    "onCommand:apiGraphVisualizer.softDeleteFromBuildFromFile",
+    "onCommand:apiGraphVisualizer.hardDeleteFromBuildFromFile",
+    "onCommand:apiGraphVisualizer.restoreFromBuildFromFile",
+    "onCommand:apiGraphVisualizer.openBacktrackedGraphsFolder",
+    "onCommand:apiGraphVisualizer.copyMcpServerConfig",
+    "onCommand:apiGraphVisualizer.openMcpReadme"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -203,10 +221,15 @@
           "default": "node",
           "description": "Node binary used in the copied Cursor MCP `command` field. If the Agent never lists `read_md_handler_file`, set this to the full path from `which node` (Cursor often does not load nvm from your shell)."
         },
-        "apiGraphVisualizer.mcp.writeGlobalMcp": {
+        "apiGraphVisualizer.mcp.runInProjectTerminal": {
           "type": "boolean",
           "default": true,
-          "description": "When the MCP checkmark is on, also write explorer-map-md to ~/.cursor/mcp.json. Cursor’s Agent often only lists tools when the server appears in user and/or project mcp config."
+          "description": "Run the Explorer Map MCP process in a dedicated integrated terminal (cwd = this workspace). Recommended so each project uses its own folder and the server is not started as a hidden background process. Set false to use a headless process instead (same machine; still not shared across machines)."
+        },
+        "apiGraphVisualizer.mcp.writeGlobalMcp": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also write the MCP entry to ~/.cursor/mcp.json. Leave off so only this workspace’s .cursor/mcp.json registers the server (keeps the Agent/LLM tools scoped to that project). Turn on only if you need the same key in user-level config too."
         },
         "apiGraphVisualizer.mcp.autoReloadWindowOnToggle": {
           "type": "boolean",
@@ -218,7 +241,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "node esbuild.js --production && npm run build --prefix mcp-md-handler",
+    "build": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
     "lint": "eslint src --ext ts"
   },

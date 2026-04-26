@@ -53,6 +53,25 @@ npm install
 npm run build
 ```
 
+## Install the extension locally
+
+From this repo root, package and install the VSIX:
+
+```bash
+npm install
+npm run build
+npx @vscode/vsce package
+code --install-extension api-graph-visualizer-0.1.0.vsix
+```
+
+If you use Cursor instead of VS Code CLI, replace the last line with:
+
+```bash
+cursor --install-extension api-graph-visualizer-0.1.0.vsix
+```
+
+To reinstall after changes, rebuild and run the same install command again.
+
 Use **Run Extension** from the Debug view (or F5) with this folder open in VS Code. `npm run watch` keeps `esbuild` rebuilding while you hack.
 
 Publishing still goes through the usual `vsce` flow; bump `version` in `package.json` when you cut a release.
