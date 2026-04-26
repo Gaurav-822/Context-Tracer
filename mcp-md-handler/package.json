@@ -1,0 +1,20 @@
+{
+  "name": "mcp-md-handler",
+  "version": "1.0.0",
+  "description": "MCP stdio server: read md/ notes and write workflow graphs to visualizer/backtracked/ (File Graph Visualizer extension)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.3.0"
+  }
+}

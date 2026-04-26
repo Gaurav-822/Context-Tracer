@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "publisher": "gauravbhushan",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.100.0"
   },
   "categories": [
     "Visualization"
@@ -71,6 +71,14 @@
         "command": "apiGraphVisualizer.openBacktrackedGraphsFolder",
         "title": "File Graph: Open backtracked graphs folder",
         "icon": "$(folder-opened)"
+      },
+      {
+        "command": "apiGraphVisualizer.copyMcpServerConfig",
+        "title": "Explorer Map: Copy Cursor MCP config (md handler)"
+      },
+      {
+        "command": "apiGraphVisualizer.openMcpReadme",
+        "title": "Explorer Map: Open MCP server README"
       }
     ],
     "keybindings": [
@@ -171,6 +179,12 @@
         }
       ]
     },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "apiGraphVisualizer.explorerMapMd",
+        "label": "Explorer Map (md notes MCP)"
+      }
+    ],
     "configuration": {
       "title": "Explorer Map",
       "properties": {
@@ -178,19 +192,39 @@
           "type": "boolean",
           "default": false,
           "description": "Deprecated: automatic graph opening from active editor is disabled; use Explorer Map tree actions."
+        },
+        "apiGraphVisualizer.mcp.showRunnerTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show “Open MCP server in terminal” in Explorer Map → Features. Set false to hide (Cursor still runs MCP from its own config)."
+        },
+        "apiGraphVisualizer.mcp.nodeExecutable": {
+          "type": "string",
+          "default": "node",
+          "description": "Node binary used in the copied Cursor MCP `command` field. If the Agent never lists `read_md_handler_file`, set this to the full path from `which node` (Cursor often does not load nvm from your shell)."
+        },
+        "apiGraphVisualizer.mcp.writeGlobalMcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the MCP checkmark is on, also write explorer-map-md to ~/.cursor/mcp.json. Cursor’s Agent often only lists tools when the server appears in user and/or project mcp config."
+        },
+        "apiGraphVisualizer.mcp.autoReloadWindowOnToggle": {
+          "type": "boolean",
+          "default": true,
+          "description": "After successfully toggling MCP on or off, reload the window automatically so Cursor picks up mcp.json changes. Set false to reload manually (Developer: Reload Window)."
         }
       }
     }
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "node esbuild.js --production",
+    "build": "node esbuild.js --production && npm run build --prefix mcp-md-handler",
     "watch": "node esbuild.js --watch",
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.100.0",
     "esbuild": "^0.24.0"
   },
   "dependencies": {

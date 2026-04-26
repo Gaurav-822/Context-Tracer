@@ -1,5 +1,7 @@
 .vscode/**
 node_modules/**
+mcp-md-handler/node_modules/**
+mcp-md-handler/src/**
 src/**
 tsconfig.json
 esbuild.js

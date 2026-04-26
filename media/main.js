@@ -6,9 +6,6 @@
   const nodeCountEl = document.getElementById('nodeCount');
   const edgeCountEl = document.getElementById('edgeCount');
   const centerBtn = document.getElementById('centerBtn');
-  const connectBtn = document.getElementById('connectBtn');
-  const levelNavDeeper = document.getElementById('levelNavDeeper');
-  const levelNavShallower = document.getElementById('levelNavShallower');
   const tabBar = document.getElementById('graph-tab-bar');
   const nodeInfoPopover = document.getElementById('nodeInfoPopover');
   const nodeInfoTitle = document.getElementById('nodeInfoTitle');
@@ -17,6 +14,14 @@
   const nodeInfoClose = document.getElementById('nodeInfoClose');
   const nodeInfoNext = document.getElementById('nodeInfoNext');
   const nodeInfoRevert = document.getElementById('nodeInfoRevert');
+  const mdEditorDock = document.getElementById('mdEditorDock');
+  const mdEditorBackdrop = document.getElementById('mdEditorBackdrop');
+  const mdEditorTitle = document.getElementById('mdEditorTitle');
+  const mdEditorBody = document.getElementById('mdEditorBody');
+  const mdEditorSave = document.getElementById('mdEditorSave');
+  const mdEditorSizeStrip = document.getElementById('mdEditorSizeStrip');
+  const mdEditorSizeIcon = document.getElementById('mdEditorSizeIcon');
+  const mdEditorDirty = document.getElementById('mdEditorDirty');
 
   /** @type {Map<string, { graphSnapshots: object, routeNames: string[], initialRouteId?: string }>} */
   const sessions = new Map();
@@ -83,6 +88,342 @@
   function clearLayerRevealTimers() {
     layerRevealTimers.forEach((id) => clearTimeout(id));
     layerRevealTimers = [];
+  }
+
+  function postGraphSidebarState() {
+    const sel = network && typeof network.getSelectedNodes === 'function' ? network.getSelectedNodes() || [] : [];
+    const show = sel.length > 0;
+    let connectLabel = 'Connect imports';
+    if (connectMode && connectFromNodeId) {
+      connectLabel = `Select target for ${String(connectFromNodeId).split('/').pop() || connectFromNodeId}`;
+    } else if (connectMode) {
+      connectLabel = 'Connect: pick source node';
+    }
+    vscode.postMessage({
+      type: 'cmd:graphSidebarState',
+      showConnectImports: show,
+      connectLabel,
+      connectActive: connectMode,
+    });
+  }
+
+  const MD_PANEL_FILES = new Set(['skills.md', 'learnings.md', 'architecture.md', 'mistakes.md', 'working.md']);
+  const MD_DOCK_MIN = 220;
+  /** If dock width (as fraction of window) is at or above this, treat as full width. */
+  const MD_DOCK_FULL_FRACTION = 0.95;
+  let mdEditorFileName = null;
+  let mdEditorSavedText = '';
+  let mdDockExpanded = false;
+  /** Current docked width (px) when not full-screen. */
+  let mdDockWidthPx = 0;
+  /** Width to restore when leaving full-screen (set before expanding). */
+  let mdDockWidthBeforeFull = 0;
+  /** @type {{ startX: number, startW: number, pointerId: number, moved: boolean, wasExpanded: boolean, unlocked: boolean } | null} */
+  let mdStripDrag = null;
+
+  function clampDockWidth(w) {
+    const max = Math.max(MD_DOCK_MIN, window.innerWidth);
+    return Math.min(max, Math.max(MD_DOCK_MIN, Math.round(w)));
+  }
+
+  function isMdDockVisuallyFull() {
+    if (!mdEditorDock) return false;
+    if (mdDockExpanded) return true;
+    try {
+      const w = mdEditorDock.getBoundingClientRect().width;
+      return w >= window.innerWidth * MD_DOCK_FULL_FRACTION;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function syncMdStripUI() {
+    const full = isMdDockVisuallyFull();
+    if (mdEditorSizeIcon) {
+      mdEditorSizeIcon.textContent = full ? '◀' : '▶';
+    }
+    if (mdEditorSizeStrip) {
+      mdEditorSizeStrip.title = full
+        ? 'Drag to shrink — past the edge to leave full width'
+        : 'Drag to resize width (past 95% snaps to full width)';
+      mdEditorSizeStrip.setAttribute(
+        'aria-label',
+        full ? 'Drag to resize; drag from full width to restore side width' : 'Drag to resize editor width'
+      );
+    }
+  }
+
+  function applyMdDockLayout() {
+    if (!mdEditorDock) return;
+    if (mdDockExpanded) {
+      mdEditorDock.classList.add('md-editor-dock-expanded');
+      mdEditorDock.style.removeProperty('width');
+    } else {
+      mdEditorDock.classList.remove('md-editor-dock-expanded');
+      if (mdDockWidthPx < MD_DOCK_MIN) {
+        mdDockWidthPx = clampDockWidth(window.innerWidth * 0.3);
+      } else {
+        mdDockWidthPx = clampDockWidth(mdDockWidthPx);
+      }
+      if (mdDockWidthBeforeFull < MD_DOCK_MIN) {
+        mdDockWidthBeforeFull = mdDockWidthPx;
+      }
+      mdEditorDock.style.width = `${mdDockWidthPx}px`;
+    }
+    syncMdStripUI();
+  }
+
+  function setMdDockExpanded(expanded) {
+    if (!mdEditorDock) {
+      mdDockExpanded = !!expanded;
+      return;
+    }
+    if (expanded) {
+      if (!isMdDockVisuallyFull()) {
+        try {
+          const w = clampDockWidth(mdEditorDock.getBoundingClientRect().width);
+          mdDockWidthPx = w;
+          mdDockWidthBeforeFull = w;
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      mdDockExpanded = true;
+    } else {
+      mdDockExpanded = false;
+      if (mdDockWidthBeforeFull >= MD_DOCK_MIN) {
+        mdDockWidthPx = clampDockWidth(mdDockWidthBeforeFull);
+      } else if (mdDockWidthPx < MD_DOCK_MIN) {
+        mdDockWidthPx = clampDockWidth(window.innerWidth * 0.35);
+        mdDockWidthBeforeFull = mdDockWidthPx;
+      }
+    }
+    applyMdDockLayout();
+  }
+
+  function onMdStripPointerDown(e) {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    if (!mdEditorDock || !mdEditorSizeStrip) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    let w0;
+    try {
+      w0 = mdEditorDock.getBoundingClientRect().width;
+    } catch (_e) {
+      return;
+    }
+    mdStripDrag = {
+      startX: e.clientX,
+      startW: w0,
+      pointerId: e.pointerId,
+      moved: false,
+      wasExpanded: !!mdDockExpanded,
+      unlocked: false,
+    };
+    mdEditorDock.classList.add('md-editor-dock--dragging');
+    try {
+      mdEditorSizeStrip.setPointerCapture(e.pointerId);
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  function onMdStripPointerMove(e) {
+    if (!mdStripDrag || !mdEditorDock) return;
+    if (e.pointerId !== undefined && e.pointerId !== mdStripDrag.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (Math.abs(e.clientX - mdStripDrag.startX) > 2) {
+      mdStripDrag.moved = true;
+    }
+    if (mdStripDrag.wasExpanded && !mdStripDrag.unlocked) {
+      if (Math.abs(e.clientX - mdStripDrag.startX) < 2) {
+        return;
+      }
+      mdStripDrag.unlocked = true;
+      mdDockWidthBeforeFull = mdStripDrag.startW;
+      mdDockExpanded = false;
+      mdEditorDock.classList.remove('md-editor-dock-expanded');
+      mdEditorDock.style.width = `${clampDockWidth(mdStripDrag.startW)}px`;
+    }
+    const newW = clampDockWidth(mdStripDrag.startW + (e.clientX - mdStripDrag.startX));
+    const cap = window.innerWidth;
+    const fullThreshold = cap * MD_DOCK_FULL_FRACTION;
+    if (newW >= fullThreshold) {
+      if (!mdDockExpanded) {
+        try {
+          const cur = mdEditorDock.getBoundingClientRect().width;
+          if (cur < fullThreshold) {
+            mdDockWidthBeforeFull = clampDockWidth(cur);
+          }
+        } catch (_e) {
+          /* ignore */
+        }
+      }
+      mdDockExpanded = true;
+      mdEditorDock.classList.add('md-editor-dock-expanded');
+      mdEditorDock.style.removeProperty('width');
+    } else {
+      mdDockExpanded = false;
+      mdEditorDock.classList.remove('md-editor-dock-expanded');
+      mdEditorDock.style.width = `${newW}px`;
+      mdDockWidthPx = newW;
+      mdDockWidthBeforeFull = newW;
+    }
+    syncMdStripUI();
+  }
+
+  function onMdStripPointerUp(e) {
+    if (!mdStripDrag || !mdEditorDock) return;
+    if (e.pointerId !== undefined && e.pointerId !== mdStripDrag.pointerId) return;
+    const moved = mdStripDrag.moved;
+    try {
+      mdEditorSizeStrip?.releasePointerCapture(mdStripDrag.pointerId);
+    } catch (_e) {
+      /* ignore */
+    }
+    mdEditorDock.classList.remove('md-editor-dock--dragging');
+    if (moved) {
+      try {
+        if (!mdDockExpanded) {
+          const cap = window.innerWidth;
+          const rw = mdEditorDock.getBoundingClientRect().width;
+          if (rw >= cap * MD_DOCK_FULL_FRACTION) {
+            setMdDockExpanded(true);
+          } else {
+            mdDockWidthPx = clampDockWidth(rw);
+            mdDockWidthBeforeFull = mdDockWidthPx;
+          }
+        }
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    if (moved) {
+      requestAnimationFrame(() => {
+        try {
+          if (mdEditorBody) {
+            mdEditorBody.focus();
+          }
+        } catch (_e) {
+          /* ignore */
+        }
+      });
+    }
+    mdStripDrag = null;
+  }
+
+  function onMdDockWindowResize() {
+    if (!isMdEditorOpen() || !mdEditorDock) return;
+    if (mdStripDrag) {
+      return;
+    }
+    if (mdDockExpanded) {
+      return;
+    }
+    const cap = window.innerWidth;
+    mdDockWidthPx = clampDockWidth(Math.min(mdDockWidthPx, cap));
+    mdEditorDock.classList.remove('md-editor-dock-expanded');
+    mdEditorDock.style.width = `${mdDockWidthPx}px`;
+    syncMdStripUI();
+  }
+
+  function isMdEditorOpen() {
+    return !!(mdEditorDock && mdEditorDock.classList.contains('open'));
+  }
+
+  function setMdDirty(on) {
+    if (mdEditorDirty) mdEditorDirty.style.display = on ? 'inline' : 'none';
+  }
+
+  function syncMdDirty() {
+    if (!mdEditorBody) return;
+    setMdDirty(mdEditorFileName != null && mdEditorBody.value !== mdEditorSavedText);
+  }
+
+  function openMdEditorPanel(fileName, content) {
+    if (!mdEditorDock || !mdEditorBackdrop || !mdEditorBody || !mdEditorTitle) return;
+    setMdDockExpanded(false);
+    mdEditorFileName = fileName;
+    mdEditorSavedText = String(content ?? '');
+    mdEditorBody.value = mdEditorSavedText;
+    mdEditorTitle.textContent = fileName;
+    setMdDirty(false);
+    mdEditorDock.classList.remove('open');
+    mdEditorBackdrop.classList.remove('visible');
+    mdEditorDock.setAttribute('aria-hidden', 'true');
+    mdEditorBackdrop.setAttribute('aria-hidden', 'true');
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!mdEditorDock || !mdEditorBackdrop) return;
+        mdEditorDock.classList.add('open');
+        mdEditorDock.setAttribute('aria-hidden', 'false');
+        mdEditorBackdrop.classList.add('visible');
+        mdEditorBackdrop.setAttribute('aria-hidden', 'false');
+        try {
+          mdEditorBody.focus();
+        } catch (_e) {
+          /* ignore */
+        }
+      });
+    });
+  }
+
+  function closeMdEditorPanel() {
+    if (!mdEditorDock || !mdEditorBackdrop) return;
+    if (mdStripDrag) {
+      try {
+        if (mdEditorSizeStrip) {
+          mdEditorSizeStrip.releasePointerCapture(mdStripDrag.pointerId);
+        }
+      } catch (_e) {
+        /* ignore */
+      }
+      mdStripDrag = null;
+    }
+    mdEditorDock.classList.remove('md-editor-dock--dragging');
+    setMdDockExpanded(false);
+    mdEditorDock.classList.remove('open');
+    mdEditorDock.setAttribute('aria-hidden', 'true');
+    mdEditorBackdrop.classList.remove('visible');
+    mdEditorBackdrop.setAttribute('aria-hidden', 'true');
+    mdEditorFileName = null;
+    mdEditorSavedText = '';
+    if (mdEditorBody) mdEditorBody.value = '';
+    if (mdEditorTitle) mdEditorTitle.textContent = '—';
+    setMdDirty(false);
+  }
+
+  function saveMdEditor() {
+    if (!mdEditorFileName || !mdEditorBody) return;
+    vscode.postMessage({
+      type: 'cmd:saveMdFile',
+      fileName: mdEditorFileName,
+      content: mdEditorBody.value,
+    });
+  }
+
+  function initMdEditorUi() {
+    if (mdEditorBody) {
+      mdEditorBody.addEventListener('input', () => syncMdDirty());
+    }
+    if (mdEditorSave) {
+      mdEditorSave.addEventListener('click', () => saveMdEditor());
+    }
+    if (mdEditorSizeStrip) {
+      mdEditorSizeStrip.addEventListener('pointerdown', onMdStripPointerDown, true);
+      mdEditorSizeStrip.addEventListener('pointermove', onMdStripPointerMove, true);
+      mdEditorSizeStrip.addEventListener('pointerup', onMdStripPointerUp, true);
+      mdEditorSizeStrip.addEventListener('pointercancel', onMdStripPointerUp, true);
+    }
+    window.addEventListener('resize', onMdDockWindowResize);
+    if (mdEditorDock) {
+      mdEditorDock.addEventListener('click', (e) => e.stopPropagation());
+    }
   }
 
   function updateZoomBounds(totalNodes) {
@@ -1047,22 +1388,6 @@
         network.fit({ animation: { duration: 450, easingFunction: 'easeInOutQuad' } });
       });
     }
-    if (connectBtn) {
-      const updateConnectBtn = () => {
-        connectBtn.classList.toggle('active', connectMode);
-        if (connectMode && connectFromNodeId) {
-          connectBtn.textContent = `Select target for ${connectFromNodeId.split('/').pop() || connectFromNodeId}`;
-        } else {
-          connectBtn.textContent = connectMode ? 'Connect: pick source node' : 'Connect imports';
-        }
-      };
-      connectBtn.addEventListener('click', () => {
-        connectMode = !connectMode;
-        connectFromNodeId = null;
-        updateConnectBtn();
-      });
-      updateConnectBtn();
-    }
     network.on('selectNode', () => {
       if (suppressSelectionStyleEvents) return;
       const selectedIds = network.getSelectedNodes();
@@ -1078,10 +1403,7 @@
         const picked = selectedId;
         if (!connectFromNodeId) {
           connectFromNodeId = picked;
-          if (connectBtn) {
-            connectBtn.textContent = `Select target for ${picked.split('/').pop() || picked}`;
-            connectBtn.classList.add('active');
-          }
+          postGraphSidebarState();
           return;
         }
         if (connectFromNodeId && connectFromNodeId !== picked) {
@@ -1095,12 +1417,9 @@
         }
         connectFromNodeId = null;
         connectMode = false;
-        if (connectBtn) {
-          connectBtn.textContent = 'Connect imports';
-          connectBtn.classList.remove('active');
-        }
       }
       applySelectionHighlightForCount(selectedIds);
+      postGraphSidebarState();
     });
 
     network.on('deselectNode', () => {
@@ -1111,12 +1430,14 @@
         bfsNavCurrentLevel = null;
         bfsNavIsActive = false;
         restoreStyles();
+        postGraphSidebarState();
         return;
       }
       bfsNavAnchorNodeId = remaining[0];
       bfsNavCurrentLevel = getNodeImportLevel(remaining[0]);
       bfsNavIsActive = false;
       applySelectionHighlightForCount(remaining);
+      postGraphSidebarState();
     });
     network.on('hoverNode', (params) => {
       if (!params || !params.node) return;
@@ -1416,22 +1737,15 @@
         hideNodeInfoPopover();
       });
     }
-    if (levelNavDeeper) {
-      levelNavDeeper.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        highlightAdjacentImportLevel(1);
-      });
-    }
-    if (levelNavShallower) {
-      levelNavShallower.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        highlightAdjacentImportLevel(-1);
-      });
-    }
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') hideNodeInfoPopover();
+      if (e.key === 'Escape') {
+        if (isMdEditorOpen()) {
+          closeMdEditorPanel();
+          e.preventDefault();
+          return;
+        }
+        hideNodeInfoPopover();
+      }
     });
     window.addEventListener(
       'keydown',
@@ -1454,6 +1768,12 @@
           }
         }
         if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+          if (mdEditorBody && document.activeElement === mdEditorBody) {
+            e.preventDefault();
+            e.stopPropagation();
+            saveMdEditor();
+            return;
+          }
           if (activeSessionKey && sessions.get(activeSessionKey)) {
             e.preventDefault();
             postSaveSessionForKey(activeSessionKey, false);
@@ -1807,6 +2127,61 @@
   }
 
   /**
+   * vis-network's DataSet keeps one item per `id`. Workflow JSON can list multiple `nodes` with
+   * the same `id` (one box on screen, wrong edge wiring). `Flow:` saved graphs: assign unique
+   * ids in order and rebuild a left-to-right chain so the map matches the step list.
+   */
+  function uniqueifyFlowSnapshotNodeIds(snapshot) {
+    const nodes = snapshot.nodes || [];
+    if (nodes.length <= 1) return snapshot;
+    if (new Set(nodes.map((n) => n.id)).size === nodes.length) return snapshot;
+    const used = new Set();
+    const newNodes = nodes.map((n) => {
+      const base = String(n.id != null && n.id !== '' ? n.id : 'node');
+      let id = base;
+      if (!used.has(id)) {
+        used.add(id);
+        return { ...n, id: id };
+      }
+      var m = 2;
+      var cand = base + '__' + m;
+      while (used.has(cand)) {
+        m += 1;
+        cand = base + '__' + m;
+      }
+      used.add(cand);
+      return { ...n, id: cand };
+    });
+    var e0 = (snapshot.edges && snapshot.edges[0]) || null;
+    var defColor = e0 && e0.color;
+    var defaultEdge = e0
+      ? {
+          color: defColor,
+          width: e0.width,
+          selectionWidth: e0.selectionWidth,
+          smooth: e0.smooth,
+        }
+      : {
+          color: { color: 'rgba(255,255,255,0.25)', highlight: '#FFC107', hover: '#FFC107' },
+          width: 1.5,
+          selectionWidth: 2,
+          smooth: false,
+        };
+    var newEdges = [];
+    for (var i2 = 0; i2 < newNodes.length - 1; i2 += 1) {
+      newEdges.push({
+        from: newNodes[i2].id,
+        to: newNodes[i2 + 1].id,
+        color: defaultEdge.color,
+        width: defaultEdge.width,
+        selectionWidth: defaultEdge.selectionWidth,
+        smooth: defaultEdge.smooth,
+      });
+    }
+    return { ...snapshot, nodes: newNodes, edges: newEdges, fixedLayout: false };
+  }
+
+  /**
    * Seed node coordinates so first paint isn't clumped at the center.
    * Physics then refines from this spread-out baseline.
    */
@@ -1963,6 +2338,7 @@
         requestAnimationFrame(() => focusEntry(true));
         if (loadingOverlay) loadingOverlay.classList.remove('visible');
         syncNetworkSize();
+        postGraphSidebarState();
         return;
       }
       const lv = sortedLevels[levelIndex];
@@ -1985,6 +2361,8 @@
   }
 
   function loadGraph(routeId) {
+    connectMode = false;
+    connectFromNodeId = null;
     if (activeSessionKey && currentRouteId && currentRouteId !== routeId) {
       flushCurrentRoutePositionsToSession(activeSessionKey);
     }
@@ -1992,6 +2370,7 @@
     const snap = graphSnapshots[routeId];
     if (!snap) {
       if (loadingOverlay) loadingOverlay.classList.remove('visible');
+      postGraphSidebarState();
       return;
     }
     clearLayerRevealTimers();
@@ -2006,7 +2385,10 @@
     nodes.clear();
     edges.clear();
 
-    const current = stripEntryNodes(snap);
+    var current = stripEntryNodes(snap);
+    if (String(routeId).indexOf('Flow:') === 0) {
+      current = uniqueifyFlowSnapshotNodeIds(current);
+    }
     nodeImportLevelById = Object.create(null);
     (current.nodes || []).forEach((n) => {
       nodeImportLevelById[n.id] = getImportLevel(n);
@@ -2096,7 +2478,76 @@
       if (activeSessionKey && currentRouteId) {
         flushCurrentRoutePositionsToSession(activeSessionKey);
       }
+      postGraphSidebarState();
       return;
+    }
+
+    /** Flow: (route id Flow: …) with importLevel 0..n — same layer layout as import depth, not circular physics. */
+    const isFlowRoute = String(routeId).indexOf('Flow:') === 0;
+    const allHaveImportLevelForFlow =
+      isFlowRoute &&
+      totalNodes > 0 &&
+      (current.nodes || []).every((n) => typeof n.importLevel === 'number');
+    if (allHaveImportLevelForFlow && !useFixedLayout && !shouldProgressiveReveal) {
+      try {
+        network.setOptions({
+          physics: { enabled: false },
+          interaction: NETWORK_INTERACTION,
+          edges: EDGE_DISPLAY_DEFAULTS,
+        });
+        try {
+          network.stopSimulation();
+        } catch (e) {
+          /* ignore */
+        }
+        const rawEdges = (current.edges || []).map((e) => {
+          const { title: _t, ...r } = e;
+          return r;
+        });
+        const byLevel = new Map();
+        for (const n of nodesForVisRaw) {
+          const lv = getImportLevel(n);
+          if (!byLevel.has(lv)) byLevel.set(lv, []);
+          byLevel.get(lv).push(n);
+        }
+        const levelKeys = [...byLevel.keys()].sort((a, b) => a - b);
+        const positioned = [];
+        for (const lv of levelKeys) {
+          const batch = byLevel.get(lv) || [];
+          positioned.push(...positionNodesForImportLevel(lv, batch, rawEdges));
+        }
+        nodes.add(positioned);
+        edges.add(edgesForVis);
+        nodeCountEl.textContent = String(totalNodes);
+        edgeCountEl.textContent = String((current.edges || []).length);
+        const nodeIds = (current.nodes || []).map((n) => n.id).sort((a, b) => a.localeCompare(b));
+        vscode.postMessage({ type: 'graphMetaReady', routeNames, nodeIds, currentRouteId: routeId });
+        const autoScaleFx = computeAutoNodeScale(totalNodes);
+        if (userNodeSizeScale === 1 && autoScaleFx !== 1) {
+          applyNodeSizeScale(autoScaleFx);
+        } else if (userNodeSizeScale !== 1) {
+          applyNodeSizeScale(userNodeSizeScale);
+        } else {
+          scheduleZoomReadableSizing(network ? network.getScale() : 1);
+        }
+        const fitMaxZoomFx =
+          totalNodes > 1200 ? 0.15 :
+          totalNodes > 700 ? 0.18 :
+          totalNodes > 350 ? 0.22 :
+          totalNodes > 150 ? 0.28 :
+          totalNodes > 60 ? 0.38 :
+          0.5;
+        network.fit({ animation: false, maxZoomLevel: fitMaxZoomFx });
+        if (loadingOverlay) loadingOverlay.classList.remove('visible');
+        syncNetworkSize();
+        if (activeSessionKey && currentRouteId) {
+          flushCurrentRoutePositionsToSession(activeSessionKey);
+        }
+        postGraphSidebarState();
+        return;
+      } catch (_flErr) {
+        /* fall through to physics */
+      }
     }
 
     if (hasImportLevels && shouldProgressiveReveal && totalNodes > 0) {
@@ -2178,6 +2629,7 @@
       if (activeSessionKey && currentRouteId) {
         flushCurrentRoutePositionsToSession(activeSessionKey);
       }
+      postGraphSidebarState();
     };
 
     const finishAfterTimeout = () => {
@@ -2341,6 +2793,7 @@
     if (activeSessionKey) {
       markGraphSessionDirty(activeSessionKey);
     }
+    postGraphSidebarState();
     return true;
   }
 
@@ -2538,8 +2991,35 @@
         }, 500);
         break;
       }
+      case 'cmd:toggleConnectImports': {
+        connectMode = !connectMode;
+        connectFromNodeId = null;
+        postGraphSidebarState();
+        break;
+      }
+      case 'cmd:openMdPanel': {
+        const fn = message.fileName;
+        if (typeof fn !== 'string' || !MD_PANEL_FILES.has(fn)) break;
+        if (mdEditorFileName === fn && isMdEditorOpen()) {
+          closeMdEditorPanel();
+          break;
+        }
+        openMdEditorPanel(fn, String(message.content ?? ''));
+        break;
+      }
+      case 'cmd:mdFileSaveResult': {
+        const fn = message.fileName;
+        if (typeof fn === 'string' && fn === mdEditorFileName) {
+          if (message.ok && mdEditorBody) {
+            mdEditorSavedText = mdEditorBody.value;
+            setMdDirty(false);
+          }
+        }
+        break;
+      }
     }
   });
 
+  initMdEditorUi();
   vscode.postMessage({ type: 'ready' });
 })();

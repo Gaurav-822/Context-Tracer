@@ -325,70 +325,167 @@ body {
   color: #58a6ff;
 }
 
-#connectBtn {
-  position: absolute;
-  left: 20px;
-  padding: 8px 14px;
-  background: #161b22;
-  color: #c9d1d9;
-  border: 1px solid rgba(255,255,255,0.1);
-  border-radius: 8px;
-  font-size: 12px;
-  font-family: 'Inter', -apple-system, sans-serif;
-  font-weight: 600;
-  cursor: pointer;
+/* ── MD notes (slides from left, ~30% width) ─────────────────────────── */
+.md-editor-backdrop {
+  position: fixed;
+  inset: 0;
   z-index: 1002;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition: none;
+}
+.md-editor-backdrop.visible {
+  /* Keep non-interactive so the graph remains clickable while the editor is open */
+  pointer-events: none;
+  opacity: 0;
+}
+.md-editor-dock {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  /* Default width set from JS; fallback before first open */
+  width: 30%;
+  min-width: 220px;
+  max-width: 100%;
+  z-index: 1003;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  background: #0d1117;
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 8px 0 32px rgba(0, 0, 0, 0.45);
+  transform: translateX(-102%);
+  transition:
+    transform 0.26s cubic-bezier(0.22, 1, 0.36, 1),
+    width 0.28s ease;
   pointer-events: auto;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-  letter-spacing: 0.2px;
+  overflow: hidden;
+  box-sizing: border-box;
 }
-
-#connectBtn { bottom: 56px; }
-
-#connectBtn:hover {
-  background: #1c2128;
-  border-color: rgba(88,166,255,0.4);
-  color: #58a6ff;
+.md-editor-dock.md-editor-dock--dragging {
+  transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
 }
-
-#connectBtn.active {
-  background: rgba(88,166,255,0.16);
-  border-color: rgba(88,166,255,0.55);
-  color: #79c0ff;
+.md-editor-dock.open {
+  transform: translateX(0);
 }
-
-/* ── Import depth (matches ↑ / ↓ when a node is selected) ─────────────── */
-#levelNav {
-  position: absolute;
-  bottom: 100px;
-  left: 20px;
-  z-index: 1002;
+.md-editor-dock.md-editor-dock-expanded {
+  width: 100% !important;
+  min-width: 0 !important;
+}
+.md-editor-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  pointer-events: auto;
+  overflow: hidden;
 }
-.level-nav-btn {
-  width: 34px;
-  height: 30px;
-  padding: 0;
+.md-editor-size-strip {
+  flex-shrink: 0;
+  width: 20px;
+  min-width: 18px;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  background: #12161d;
+  cursor: ew-resize;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 1px;
+  color: #8b949e;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
   margin: 0;
-  background: #161b22;
-  color: #c9d1d9;
-  border: 1px solid rgba(255,255,255,0.1);
-  border-radius: 6px;
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.md-editor-size-strip:hover {
+  background: #1c2128;
+  color: #58a6ff;
+  border-left-color: rgba(88, 166, 255, 0.35);
+}
+.md-editor-size-strip:focus {
+  outline: none;
+}
+.md-editor-size-strip:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.55);
+  color: #58a6ff;
+}
+.md-editor-size-icon {
   font-size: 13px;
   line-height: 1;
+  pointer-events: none;
+  user-select: none;
+}
+.md-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #161b22;
+}
+.md-editor-title {
   font-family: 'Inter', -apple-system, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  color: #c9d1d9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 55%;
+}
+.md-editor-toolbar-spacer { flex: 1; }
+.md-editor-dirty {
+  color: #d29922;
+  font-size: 11px;
+  margin-right: 4px;
+}
+.md-editor-toolbar-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
-.level-nav-btn:hover {
-  background: #1c2128;
-  border-color: rgba(88,166,255,0.4);
+.md-editor-toolbar-btn:hover {
+  background: #30363d;
+  border-color: rgba(88, 166, 255, 0.45);
   color: #58a6ff;
+}
+.md-editor-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 12px 14px;
+  border: none;
+  resize: none;
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  tab-size: 2;
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 /* ── Legend & stats ───────────────────────────────────────────────────── */

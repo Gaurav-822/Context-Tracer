@@ -100,6 +100,12 @@ export class GraphPanel {
   private onConnectNodes:
     | ((payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void)
     | null = null;
+  private onGraphSidebarState:
+    | ((payload: { showConnectImports: boolean; connectLabel: string; connectActive: boolean }) => void)
+    | null = null;
+  private onSaveMdFile:
+    | ((payload: { fileName: string; content: string }) => void | Promise<void>)
+    | null = null;
   private onSaveSession: ((payload: SaveSessionPayload) => void) | null = null;
   private pendingUpsert: UpsertSessionMessage | null = null;
   private readonly exportWaiters = new Map<
@@ -141,6 +147,8 @@ export class GraphPanel {
         dropY?: number;
       }) => void;
       onConnectNodes?: (payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => void;
+      onGraphSidebarState?: (payload: { showConnectImports: boolean; connectLabel: string; connectActive: boolean }) => void;
+      onSaveMdFile?: (payload: { fileName: string; content: string }) => void | Promise<void>;
       onSaveSession?: (payload: SaveSessionPayload) => void;
       /** When loading JSON that was saved after backtrack, restore tab styling without inferring from filename. */
       initialSession?: {
@@ -189,6 +197,8 @@ export class GraphPanel {
       GraphPanel.instance.onStartSidebarPlacement = hooks?.onStartSidebarPlacement ?? null;
       GraphPanel.instance.onGraphDrop = hooks?.onGraphDrop ?? null;
       GraphPanel.instance.onConnectNodes = hooks?.onConnectNodes ?? null;
+      GraphPanel.instance.onGraphSidebarState = hooks?.onGraphSidebarState ?? null;
+      GraphPanel.instance.onSaveMdFile = hooks?.onSaveMdFile ?? null;
       GraphPanel.instance.onSaveSession = hooks?.onSaveSession ?? null;
       GraphPanel.instance.deliverUpsert(msg);
       GraphPanel.instance.reveal();
@@ -232,6 +242,8 @@ export class GraphPanel {
       hooks?.onStartSidebarPlacement ?? null,
       hooks?.onGraphDrop ?? null,
       hooks?.onConnectNodes ?? null,
+      hooks?.onGraphSidebarState ?? null,
+      hooks?.onSaveMdFile ?? null,
       hooks?.onSaveSession ?? null,
       msg
     );
@@ -257,6 +269,8 @@ export class GraphPanel {
     onStartSidebarPlacement: GraphPanel['onStartSidebarPlacement'],
     onGraphDrop: GraphPanel['onGraphDrop'],
     onConnectNodes: GraphPanel['onConnectNodes'],
+    onGraphSidebarState: GraphPanel['onGraphSidebarState'],
+    onSaveMdFile: GraphPanel['onSaveMdFile'],
     onSaveSession: GraphPanel['onSaveSession'],
     firstUpsert: UpsertSessionMessage
   ) {
@@ -277,6 +291,8 @@ export class GraphPanel {
     this.onStartSidebarPlacement = onStartSidebarPlacement;
     this.onGraphDrop = onGraphDrop;
     this.onConnectNodes = onConnectNodes;
+    this.onGraphSidebarState = onGraphSidebarState;
+    this.onSaveMdFile = onSaveMdFile;
     this.onSaveSession = onSaveSession;
     this.pendingUpsert = firstUpsert;
 
@@ -451,6 +467,34 @@ export class GraphPanel {
               });
             }
             break;
+          case 'cmd:graphSidebarState': {
+            const m = message as {
+              type: string;
+              showConnectImports?: unknown;
+              connectLabel?: unknown;
+              connectActive?: unknown;
+            };
+            if (this.onGraphSidebarState) {
+              this.onGraphSidebarState({
+                showConnectImports: !!m.showConnectImports,
+                connectLabel: typeof m.connectLabel === 'string' ? m.connectLabel : 'Connect imports',
+                connectActive: !!m.connectActive,
+              });
+            }
+            break;
+          }
+          case 'cmd:saveMdFile': {
+            const m = message as { type: string; fileName?: unknown; content?: unknown };
+            if (this.onSaveMdFile && typeof m.fileName === 'string' && typeof m.content === 'string') {
+              void Promise.resolve(
+                this.onSaveMdFile({
+                  fileName: m.fileName,
+                  content: m.content,
+                })
+              );
+            }
+            break;
+          }
           case 'cmd:saveSession':
             if (this.onSaveSession && typeof message.sourceJsonPath === 'string') {
               const gs = (message as { graphSnapshots?: unknown }).graphSnapshots;
@@ -603,10 +647,28 @@ export class GraphPanel {
   <div id="dragHelp">Pan: two-finger scroll on the graph. Drag on empty canvas: rectangle select (merges with any current click-selection; click empty first to replace). Drag files onto the graph to add nodes.</div>
 
   <button id="centerBtn" title="Center graph">⊙ Center</button>
-  <button id="connectBtn" title="Connect one file to another">⇢ Connect imports</button>
-  <div id="levelNav" class="level-nav" role="toolbar" aria-label="Highlight by import depth">
-    <button type="button" id="levelNavDeeper" class="level-nav-btn" title="Deeper imports (same as ↑ key)">▲</button>
-    <button type="button" id="levelNavShallower" class="level-nav-btn" title="Shallower imports (same as ↓ key)">▼</button>
+
+  <div id="mdEditorBackdrop" class="md-editor-backdrop" aria-hidden="true"></div>
+  <div id="mdEditorDock" class="md-editor-dock" role="complementary" aria-label="Markdown notes" aria-hidden="true">
+    <div class="md-editor-main">
+      <div class="md-editor-toolbar">
+        <span id="mdEditorTitle" class="md-editor-title">—</span>
+        <div class="md-editor-toolbar-spacer"></div>
+        <span id="mdEditorDirty" class="md-editor-dirty" style="display: none">●</span>
+        <button type="button" id="mdEditorSave" class="md-editor-toolbar-btn" title="Save (⌘S / Ctrl+S)">Save</button>
+      </div>
+      <textarea id="mdEditorBody" class="md-editor-body" spellcheck="true" wrap="soft" placeholder="Write Markdown…"></textarea>
+    </div>
+    <div
+      id="mdEditorSizeStrip"
+      class="md-editor-size-strip"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Drag to resize editor width"
+      title="Drag to resize width"
+    >
+      <span id="mdEditorSizeIcon" class="md-editor-size-icon" aria-hidden="true">▶</span>
+    </div>
   </div>
 
   <div id="nodeInfoPopover" class="node-info-popover" style="display: none;" role="dialog" aria-label="Node details">

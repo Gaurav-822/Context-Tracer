@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { McpPanelSnapshot } from './mcpConfig';
 
 export type SearchResultType = 'file' | 'folder';
 
@@ -29,6 +30,7 @@ export interface SidebarPanelData {
   useLlm: boolean;
   saved: { label: string; absPath: string; relPath: string }[];
   tree: SidebarTreeNode[];
+  mcp: McpPanelSnapshot;
 }
 
 export type SidebarSavedListMessage = {
@@ -41,6 +43,13 @@ export type SidebarWorkspaceSelectionMessage = {
 };
 export type SidebarActivatePlacementMessage = {
   type: 'activatePlacement';
+};
+
+export type SidebarConnectImportsStateMessage = {
+  type: 'graphConnectImportsState';
+  show: boolean;
+  label: string;
+  active: boolean;
 };
 
 type OpenRequestMessage = {
@@ -58,7 +67,6 @@ type RequestTreeMessage = {
   useRegex?: boolean;
 };
 
-type ToggleLlmMessage = { type: 'toggleLlm' };
 type OpenSavedMessage = { type: 'openSaved'; absPath: string };
 type OpenSavedSaveAsMessage = { type: 'openSavedSaveAs'; absPath: string };
 type SavedGraphSaveInPlaceMessage = { type: 'savedGraphSaveInPlace'; absPath: string };
@@ -70,6 +78,13 @@ type SidebarDragPathsMessage = { type: 'sidebarDragPaths'; paths: string[] };
 type UndoWorkspaceRevealMessage = { type: 'undoWorkspaceReveal' };
 type PlaceInGraphMessage = { type: 'placeInGraph'; absPath: string };
 type CancelPlaceInGraphMessage = { type: 'cancelPlaceInGraph' };
+type ToggleConnectImportsMessage = { type: 'toggleConnectImports' };
+type OpenMdDocMessage = { type: 'openMdDoc'; fileName: string };
+type McpCopyConfigMessage = { type: 'mcpCopyConfig' };
+type McpRevealMessage = { type: 'mcpReveal' };
+type McpOpenReadmeMessage = { type: 'mcpOpenReadme' };
+type McpOpenRunnerMessage = { type: 'mcpOpenRunner' };
+type McpSetEnabledMessage = { type: 'mcpSetEnabled'; enabled: boolean };
 
 export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
@@ -100,6 +115,13 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       onUndoWorkspaceReveal: () => Promise<void>;
       onPlaceInGraph: (absPath: string) => Promise<void>;
       onCancelPlaceInGraph: () => Promise<void>;
+      onToggleConnectImports: () => void;
+      onOpenMdDoc: (fileName: string) => Promise<void>;
+      onMcpCopyConfig: () => Promise<void>;
+      onMcpRevealMcpHandler: () => Promise<void>;
+      onMcpOpenReadme: () => Promise<void>;
+      onMcpOpenRunnerTerminal: () => Promise<void>;
+      onMcpSetEnabled: (enabled: boolean) => Promise<void>;
       /** Snapshot of visualizer/backtracked JSON list (no workspace tree rebuild). */
       listSavedGraphsForSidebar: () => { label: string; absPath: string; relPath: string }[];
     }
@@ -132,6 +154,23 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
     void this.view.webview.postMessage(msg);
   }
 
+  postGraphConnectImportsState(payload: { showConnectImports: boolean; connectLabel: string; connectActive: boolean }): void {
+    if (!this.view) return;
+    const msg: SidebarConnectImportsStateMessage = {
+      type: 'graphConnectImportsState',
+      show: payload.showConnectImports,
+      label: payload.connectLabel,
+      active: payload.connectActive,
+    };
+    void this.view.webview.postMessage(msg);
+  }
+
+  /** Updates MCP block without rebuilding the workspace tree (e.g. when mcp settings change). */
+  postMcpPanelSnapshot(mcp: McpPanelSnapshot): void {
+    if (!this.view) return;
+    void this.view.webview.postMessage({ type: 'mcpUpdate', mcp });
+  }
+
   resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
@@ -149,7 +188,6 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       const msg = raw as
         | OpenRequestMessage
         | RequestTreeMessage
-        | ToggleLlmMessage
         | OpenSavedMessage
         | OpenSavedSaveAsMessage
         | SavedGraphSaveInPlaceMessage
@@ -161,6 +199,13 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         | UndoWorkspaceRevealMessage
         | PlaceInGraphMessage
         | CancelPlaceInGraphMessage
+        | ToggleConnectImportsMessage
+        | OpenMdDocMessage
+        | McpCopyConfigMessage
+        | McpRevealMessage
+        | McpOpenReadmeMessage
+        | McpOpenRunnerMessage
+        | McpSetEnabledMessage
         | { type: 'ready' };
       if (!msg || typeof msg !== 'object' || !('type' in msg)) return;
 
@@ -184,11 +229,6 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
           useRegex: !!msg.useRegex,
         });
         void webview.postMessage({ type: 'panelData', panel });
-        return;
-      }
-      if (msg.type === 'toggleLlm') {
-        const useLlm = await this.hooks.onToggleLlm();
-        void webview.postMessage({ type: 'llmState', useLlm });
         return;
       }
       if (msg.type === 'openSaved') {
@@ -239,6 +279,35 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       }
       if (msg.type === 'cancelPlaceInGraph') {
         await this.hooks.onCancelPlaceInGraph();
+        return;
+      }
+      if (msg.type === 'toggleConnectImports') {
+        this.hooks.onToggleConnectImports();
+        return;
+      }
+      if (msg.type === 'openMdDoc' && typeof (msg as OpenMdDocMessage).fileName === 'string') {
+        await this.hooks.onOpenMdDoc((msg as OpenMdDocMessage).fileName);
+        return;
+      }
+      if (msg.type === 'mcpCopyConfig') {
+        await this.hooks.onMcpCopyConfig();
+        return;
+      }
+      if (msg.type === 'mcpReveal') {
+        await this.hooks.onMcpRevealMcpHandler();
+        return;
+      }
+      if (msg.type === 'mcpOpenReadme') {
+        await this.hooks.onMcpOpenReadme();
+        return;
+      }
+      if (msg.type === 'mcpOpenRunner') {
+        await this.hooks.onMcpOpenRunnerTerminal();
+        return;
+      }
+      if (msg.type === 'mcpSetEnabled' && typeof (msg as { enabled?: boolean }).enabled === 'boolean') {
+        await this.hooks.onMcpSetEnabled(!!(msg as { enabled: boolean }).enabled);
+        return;
       }
     });
   }
@@ -273,7 +342,6 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       text-transform: uppercase;
       letter-spacing: 0.3px;
     }
-    .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin: 8px 0; }
     .searchTools {
       display: flex;
       justify-content: flex-end;
@@ -550,6 +618,19 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       text-overflow: ellipsis;
     }
     .nodeBtn:hover { background: var(--vscode-list-hoverBackground); }
+    .connect-imports-btn {
+      color: var(--vscode-foreground);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .connect-imports-btn:hover {
+      background: var(--vscode-list-hoverBackground) !important;
+    }
+    .connect-imports-btn.active {
+      background: var(--vscode-list-inactiveSelectionBackground) !important;
+      border-color: var(--vscode-focusBorder, var(--vscode-textLink-foreground)) !important;
+    }
     .saved-floating-menu {
       position: fixed;
       z-index: 100000;
@@ -594,6 +675,127 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
       color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
     }
+    .mcp-minimal-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .mcp-feature-folder {
+      margin-top: 0;
+    }
+    /* Indent nested MCP content (server + tools) under the folder row, like md handler files */
+    .mcp-feature-folder > ul.children.treeList {
+      margin: 0;
+      padding: 0 0 0 24px;
+      box-sizing: border-box;
+    }
+    .mcp-dir-inner.mcp-minimal-row {
+      margin-top: 0;
+      padding: 0;
+    }
+    .mcp-enable-label {
+      font-size: 11px;
+      color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+      font-weight: 500;
+    }
+    .md-feature-wrap + .md-feature-wrap {
+      margin-top: 4px;
+    }
+    .mcp-tools-section {
+      font-size: 10px;
+      line-height: 1.45;
+      color: var(--vscode-descriptionForeground);
+      padding-left: 12px;
+      box-sizing: border-box;
+    }
+    .mcp-tools-heading {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--vscode-descriptionForeground);
+      margin: 0 0 6px 0;
+      font-weight: 600;
+    }
+    .mcp-tool-block {
+      margin: 0 0 2px 0;
+    }
+    .mcp-tool-block:last-child {
+      margin-bottom: 0;
+    }
+    .mcp-tool-name-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .mcp-tool-name-mono {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      color: var(--vscode-foreground);
+      text-align: left;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .mcp-tool-id {
+      display: block;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      color: var(--vscode-foreground);
+      margin: 0 0 4px 0;
+    }
+    .mcp-tool-body {
+      margin: 0 0 4px 0;
+      padding-left: 12px;
+      box-sizing: border-box;
+    }
+    .mcp-tool-body .mcp-tool-desc {
+      margin-top: 0;
+    }
+    .mcp-tool-desc {
+      margin: 0 0 6px 0;
+    }
+    .mcp-tool-param-label {
+      margin: 4px 0 2px 0;
+      font-size: 10px;
+    }
+    .mcp-tool-files {
+      margin: 0;
+      padding: 0 0 0 10px;
+      border-left: 2px solid var(--vscode-widget-border, rgba(120, 130, 150, 0.35));
+      list-style: none;
+    }
+    .mcp-tool-files li {
+      font-size: 10px;
+      margin: 2px 0;
+    }
+    .mcp-tool-files code {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 10px;
+    }
+    .mcp-server-checkbox {
+      flex: 0 0 auto;
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      cursor: pointer;
+      vertical-align: middle;
+      accent-color: var(--vscode-textLink-foreground, var(--vscode-button-background));
+    }
+    .mcp-server-checkbox:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .mcp-cb-label {
+      cursor: pointer;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
   </style>
 </head>
 <body>
@@ -608,8 +810,12 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       <button id="toolRegex" type="button" class="toolBtn" title="Use Regular Expression" data-tip="Use Regular Expression">.*</button>
     </div>
   </div>
-  <div class="hint">Filter the workspace: <strong>File</strong> = filenames only; <strong>Folder</strong> = folder paths. With <strong>ab</strong> off, matches use word chunks (camelCase, separators). Click a file to build the graph.</div>
   <div class="sectionTitle" style="margin-top:10px;">Features</div>
+  <div id="graphConnectRow" class="graph-connect-feature" style="display: none; margin: 0 0 6px 0;">
+    <button type="button" id="connectImportsFromSidebar" class="treeRow connect-imports-btn" style="width: 100%; box-sizing: border-box; text-align: left; padding: 5px 4px; margin: 0; border: 1px solid var(--vscode-widget-border, rgba(120, 130, 150, 0.35)); border-radius: 4px; background: var(--vscode-sideBar-background, var(--vscode-panel-background));">
+      <span class="icon" style="font-size: 13px; margin-right: 6px;">⇢</span><span class="name">Connect imports</span>
+    </button>
+  </div>
   <div id="features" class="treeWrap"></div>
   <div class="sectionHeader workspaceHeader">
     <div class="sectionTitle">Workspace</div>
@@ -658,6 +864,8 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       const modeFilesEl = document.getElementById('modeFiles');
       const modeFoldersEl = document.getElementById('modeFolders');
       const featuresEl = document.getElementById('features');
+      const graphConnectRowEl = document.getElementById('graphConnectRow');
+      const connectImportsFromSidebarEl = document.getElementById('connectImportsFromSidebar');
       const savedEl = document.getElementById('saved');
       const savedFloatingMenuEl = document.getElementById('savedFloatingMenu');
       const savedFloatingMenuTitleEl = document.getElementById('savedFloatingMenuTitle');
@@ -671,8 +879,6 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       const wsUndoRevealEl = document.getElementById('wsUndoReveal');
       const workspaceFloatingMenuEl = document.getElementById('workspaceFloatingMenu');
       const workspaceFloatingMenuTitleEl = document.getElementById('workspaceFloatingMenuTitle');
-      let toggleLlmEl = null;
-      let llmSubEl = null;
       const expandedFolderState = new Map();
       let selectedWorkspacePath = '';
       let hadActiveSearch = false;
@@ -687,6 +893,231 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
       let workspaceMenuAbsPath = null;
       let placementMode = false;
       let workspaceKeyboardIndex = -1;
+      let featuresBlockInitialized = false;
+
+      function applyMcpFromPanel(mcp) {
+        if (!mcp) return;
+        var tgl = document.getElementById('mcpEnableToggle');
+        if (tgl && tgl instanceof HTMLInputElement) {
+          /* Mirror legacy switch: "on" = user wants the server; fall back to mcpEnabledAnywhere */
+          var want =
+            mcp.mcpWanted !== undefined && mcp.mcpWanted !== null
+              ? !!mcp.mcpWanted
+              : !!mcp.mcpEnabledAnywhere;
+          tgl.checked = want;
+          tgl.setAttribute('aria-checked', want ? 'true' : 'false');
+          tgl.disabled = !mcp.workspaceRoot || (!want && !mcp.distExists);
+        }
+      }
+
+      function renderFeaturesBlock(panel) {
+        if (!featuresEl) return;
+        featuresEl.innerHTML = '';
+        var mcpFromPanel = panel && panel.mcp ? panel.mcp : null;
+
+        const MD_HANDLER_MCP_FILES = [
+          'skills.md',
+          'learnings.md',
+          'architecture.md',
+          'mistakes.md',
+          'working.md',
+        ];
+        const mcpWrap = document.createElement('div');
+        mcpWrap.className = 'md-feature-wrap mcp-feature-folder';
+        const mcpFolderRow = document.createElement('button');
+        mcpFolderRow.type = 'button';
+        mcpFolderRow.className = 'treeRow';
+        mcpFolderRow.style.paddingLeft = '4px';
+        mcpFolderRow.setAttribute('aria-expanded', 'false');
+        const mcpTw = document.createElement('span');
+        mcpTw.className = 'twisty';
+        mcpTw.textContent = '▸';
+        const mcpFic = document.createElement('span');
+        mcpFic.className = 'icon folderIcon';
+        const mcpFnm = document.createElement('span');
+        mcpFnm.className = 'name';
+        mcpFnm.textContent = 'mcp';
+        mcpFolderRow.appendChild(mcpTw);
+        mcpFolderRow.appendChild(mcpFic);
+        mcpFolderRow.appendChild(mcpFnm);
+        const mcpUl = document.createElement('ul');
+        mcpUl.className = 'children treeList hidden';
+
+        const liToggle = document.createElement('li');
+        liToggle.className = 'treeItem';
+        liToggle.style.padding = '4px 4px 6px 0';
+        const toggleRow = document.createElement('div');
+        toggleRow.className = 'mcp-minimal-row mcp-dir-inner';
+        const mcpEnLabel = document.createElement('label');
+        mcpEnLabel.className = 'mcp-enable-label mcp-cb-label';
+        mcpEnLabel.setAttribute('for', 'mcpEnableToggle');
+        mcpEnLabel.textContent = 'Server (explorer-map-md)';
+        const mcpCb = document.createElement('input');
+        mcpCb.type = 'checkbox';
+        mcpCb.id = 'mcpEnableToggle';
+        mcpCb.className = 'mcp-server-checkbox';
+        mcpCb.setAttribute('aria-label', 'Enable explorer-map-md stdio server (md notes + flow graphs)');
+        mcpEnLabel.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+        });
+        mcpCb.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+        });
+        mcpCb.addEventListener('change', function (ev) {
+          ev.stopPropagation();
+          const el = ev.target;
+          if (el instanceof HTMLInputElement) {
+            vscode.postMessage({ type: 'mcpSetEnabled', enabled: el.checked });
+          }
+        });
+        toggleRow.appendChild(mcpEnLabel);
+        toggleRow.appendChild(mcpCb);
+        liToggle.appendChild(toggleRow);
+        mcpUl.appendChild(liToggle);
+
+        const liTools = document.createElement('li');
+        liTools.className = 'treeItem';
+        liTools.style.padding = '2px 4px 10px 0';
+        const toolsRoot = document.createElement('div');
+        toolsRoot.className = 'mcp-tools-section';
+        const th = document.createElement('div');
+        th.className = 'mcp-tools-heading';
+        th.textContent = 'Exposed tools';
+
+        function wireMcpToolToggle(nameRow, body, twisty) {
+          nameRow.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const hid = body.classList.toggle('hidden');
+            if (twisty) {
+              twisty.textContent = hid ? '▸' : '▾';
+            }
+            nameRow.setAttribute('aria-expanded', hid ? 'false' : 'true');
+          });
+        }
+
+        function addMcpToolBlock(name, descText, withFileParam) {
+          const block = document.createElement('div');
+          block.className = 'mcp-tool-block';
+          const nameRow = document.createElement('button');
+          nameRow.type = 'button';
+          nameRow.className = 'treeRow mcp-tool-name-row';
+          nameRow.setAttribute('aria-expanded', 'false');
+          const tw = document.createElement('span');
+          tw.className = 'twisty';
+          tw.textContent = '▸';
+          const nm = document.createElement('span');
+          nm.className = 'mcp-tool-name-mono';
+          nm.textContent = name;
+          nameRow.appendChild(tw);
+          nameRow.appendChild(nm);
+          const body = document.createElement('div');
+          body.className = 'mcp-tool-body hidden';
+          const toolDesc = document.createElement('div');
+          toolDesc.className = 'mcp-tool-desc';
+          toolDesc.textContent = descText;
+          body.appendChild(toolDesc);
+          if (withFileParam) {
+            const paramLbl = document.createElement('div');
+            paramLbl.className = 'mcp-tool-param-label';
+            paramLbl.textContent = 'Parameter fileName:';
+            body.appendChild(paramLbl);
+            const fileUl = document.createElement('ul');
+            fileUl.className = 'mcp-tool-files';
+            for (var fi = 0; fi < MD_HANDLER_MCP_FILES.length; fi++) {
+              var tli = document.createElement('li');
+              tli.appendChild(document.createTextNode('• '));
+              var cod = document.createElement('code');
+              cod.textContent = MD_HANDLER_MCP_FILES[fi];
+              tli.appendChild(cod);
+              fileUl.appendChild(tli);
+            }
+            body.appendChild(fileUl);
+          }
+          wireMcpToolToggle(nameRow, body, tw);
+          block.appendChild(nameRow);
+          block.appendChild(body);
+          toolsRoot.appendChild(block);
+        }
+
+        toolsRoot.appendChild(th);
+        addMcpToolBlock(
+          'read_md_handler_file',
+          'Read the full UTF-8 text of one Markdown file under the workspace md/ folder (via the Agent or MCP client).',
+          true
+        );
+        addMcpToolBlock(
+          'write_flow_file_graph',
+          "File flows: { order?, fileName, filePath, role }—step number in order, file location only in filePath (not the same as write_workflow_graph’s string ids). Writes visualizer/backtracked/; default opens Map via open_map.json.",
+          false
+        );
+        addMcpToolBlock(
+          'write_workflow_graph',
+          'Advanced: steps { id, label, detail? } where id is a graph key (e.g. "1","2" for edges)—not filePath; for file paths + order use write_flow_file_graph. Same backtracked folder; optional openInMap.',
+          false
+        );
+        liTools.appendChild(toolsRoot);
+        mcpUl.appendChild(liTools);
+
+        mcpFolderRow.addEventListener('click', function () {
+          var hidden = mcpUl.classList.toggle('hidden');
+          mcpTw.textContent = hidden ? '▸' : '▾';
+          mcpFolderRow.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+        });
+        mcpWrap.appendChild(mcpFolderRow);
+        mcpWrap.appendChild(mcpUl);
+        featuresEl.appendChild(mcpWrap);
+
+        const wrap = document.createElement('div');
+        wrap.className = 'md-feature-wrap';
+        const folderRow = document.createElement('button');
+        folderRow.type = 'button';
+        folderRow.className = 'treeRow';
+        folderRow.style.paddingLeft = '4px';
+        folderRow.setAttribute('aria-expanded', 'false');
+        const tw = document.createElement('span');
+        tw.className = 'twisty';
+        tw.textContent = '▸';
+        const fic = document.createElement('span');
+        fic.className = 'icon folderIcon';
+        const fnm = document.createElement('span');
+        fnm.className = 'name';
+        fnm.textContent = '.md';
+        folderRow.appendChild(tw);
+        folderRow.appendChild(fic);
+        folderRow.appendChild(fnm);
+        const ul = document.createElement('ul');
+        ul.className = 'children treeList hidden';
+        for (const f of MD_HANDLER_MCP_FILES) {
+          const li = document.createElement('li');
+          li.className = 'treeItem';
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'treeRow';
+          btn.style.paddingLeft = '20px';
+          const fi = document.createElement('span');
+          fi.className = 'icon fileIcon';
+          const nm = document.createElement('span');
+          nm.className = 'name';
+          nm.textContent = f;
+          btn.appendChild(fi);
+          btn.appendChild(nm);
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            vscode.postMessage({ type: 'openMdDoc', fileName: f });
+          });
+          li.appendChild(btn);
+          ul.appendChild(li);
+        }
+        folderRow.addEventListener('click', () => {
+          const hidden = ul.classList.toggle('hidden');
+          tw.textContent = hidden ? '▸' : '▾';
+          folderRow.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+        });
+        wrap.appendChild(folderRow);
+        wrap.appendChild(ul);
+        featuresEl.appendChild(wrap);
+        applyMcpFromPanel(mcpFromPanel);
+      }
 
       function hideSavedFloatingMenu() {
         if (!savedFloatingMenuEl) return;
@@ -1014,13 +1445,29 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
         setToolState(toolRegexEl, useRegex);
         doSearch();
       });
+      if (connectImportsFromSidebarEl) {
+        connectImportsFromSidebarEl.addEventListener('click', () => {
+          vscode.postMessage({ type: 'toggleConnectImports' });
+        });
+      }
       window.addEventListener('scroll', scheduleWorkspaceHeaderScrollState, { passive: true });
       updateWorkspaceHeaderScrollState();
 
       window.addEventListener('message', (event) => {
         const msg = event.data || {};
-        if (msg.type === 'llmState') {
-          if (llmSubEl) llmSubEl.textContent = msg.useLlm ? 'ON' : 'OFF';
+        if (msg.type === 'mcpUpdate' && msg.mcp) {
+          applyMcpFromPanel(msg.mcp);
+          return;
+        }
+        if (msg.type === 'graphConnectImportsState') {
+          if (graphConnectRowEl && connectImportsFromSidebarEl) {
+            graphConnectRowEl.style.display = msg.show ? 'block' : 'none';
+            const name = connectImportsFromSidebarEl.querySelector('.name');
+            if (name) {
+              name.textContent = String(msg.label || 'Connect imports');
+            }
+            connectImportsFromSidebarEl.classList.toggle('active', !!msg.active);
+          }
           return;
         }
         if (msg.type === 'savedListUpdate') {
@@ -1053,17 +1500,11 @@ export class SearchSidebarViewProvider implements vscode.WebviewViewProvider {
             expandedFolderState.clear();
             hadActiveSearch = false;
           }
-          featuresEl.innerHTML = '';
-          const featureBtn = document.createElement('button');
-          featureBtn.type = 'button';
-          featureBtn.className = 'treeRow';
-          featureBtn.style.paddingLeft = '4px';
-          featureBtn.innerHTML = '<span class="twisty"></span><span class="icon">⚙</span><span class="name">Use AI</span><span id="llmStateInline" class="sub" style="margin-left:auto;"></span>';
-          featureBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleLlm' }));
-          featuresEl.appendChild(featureBtn);
-          toggleLlmEl = featureBtn;
-          llmSubEl = featureBtn.querySelector('#llmStateInline');
-          if (llmSubEl) llmSubEl.textContent = panel.useLlm ? 'ON' : 'OFF';
+          if (!featuresBlockInitialized) {
+            renderFeaturesBlock(panel);
+            featuresBlockInitialized = true;
+          }
+          if (panel.mcp) applyMcpFromPanel(panel.mcp);
 
           const saved = Array.isArray(panel.saved) ? panel.saved : [];
           const nodes = Array.isArray(panel.tree) ? panel.tree : [];

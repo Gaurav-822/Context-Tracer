@@ -1,3 +1,6 @@
 node_modules/
 dist/
+mcp-md-handler/node_modules/
+mcp-md-handler/dist/
+visualizer/mcp/open_map.json
 *.vsix

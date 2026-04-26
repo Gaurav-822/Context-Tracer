@@ -10,6 +10,19 @@ import {
   relPathFromWorkspace,
 } from './searchSidebarView';
 import { getUsedLocalImportSpecsInRange } from './usedImports';
+import { registerExplorerMapMcpDefinitionProvider } from './explorerMapMcpProvider';
+import {
+  getMcpPanelSnapshot,
+  provideExplorerMapMcpDefinitions,
+  syncProgrammaticMcpStateWithLegacyFiles,
+  copyCursorMcpConfigToClipboard,
+  openMcpReadme,
+  revealMcpHandlerFolderInOs,
+  openMcpRunnerTerminal,
+  initMcpRunnerTerminalReaper,
+  setExplorerMapMcpEnabled,
+} from './mcpConfig';
+import { registerMcpOpenMapFileWatcher } from './mcpOpenMapBridge';
 
 // Heavy modules loaded lazily on first use (keeps activation instant).
 async function lazyGraphPanel() { return import('./graphPanel'); }
@@ -117,6 +130,88 @@ async function undoWorkspaceSelection(): Promise<void> {
   searchSidebarProvider.postWorkspaceSelection(previous);
 }
 
+const MD_FEATURE_FILES = new Set([
+  'skills.md',
+  'learnings.md',
+  'architecture.md',
+  'mistakes.md',
+  'working.md',
+]);
+
+async function readOrCreateWorkspaceMd(extensionUri: vscode.Uri, workspaceRoot: vscode.Uri, fileName: string): Promise<string> {
+  if (!MD_FEATURE_FILES.has(fileName)) return '';
+  const mdDir = vscode.Uri.joinPath(workspaceRoot, 'md');
+  const target = vscode.Uri.joinPath(mdDir, fileName);
+  const defaultUri = vscode.Uri.joinPath(extensionUri, 'media', 'md-defaults', fileName);
+  try {
+    await vscode.workspace.fs.createDirectory(mdDir);
+  } catch {
+    /* exists */
+  }
+  try {
+    const data = await vscode.workspace.fs.readFile(target);
+    return Buffer.from(data).toString('utf8');
+  } catch {
+    let text = `# ${fileName.replace(/\.md$/i, '')}\n\n`;
+    try {
+      const def = await vscode.workspace.fs.readFile(defaultUri);
+      text = Buffer.from(def).toString('utf8');
+    } catch {
+      /* minimal heading only */
+    }
+    await vscode.workspace.fs.writeFile(target, Buffer.from(text, 'utf8'));
+    return text;
+  }
+}
+
+async function saveWorkspaceMdFile(_extensionUri: vscode.Uri, fileName: string, content: string): Promise<boolean> {
+  if (!MD_FEATURE_FILES.has(fileName)) return false;
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) {
+    void vscode.window.showWarningMessage('No workspace folder open; could not save notes.');
+    return false;
+  }
+  const mdDir = vscode.Uri.joinPath(ws.uri, 'md');
+  const target = vscode.Uri.joinPath(mdDir, fileName);
+  try {
+    await vscode.workspace.fs.createDirectory(mdDir);
+  } catch {
+    /* exists */
+  }
+  try {
+    await vscode.workspace.fs.writeFile(target, Buffer.from(content, 'utf8'));
+    return true;
+  } catch (e) {
+    const m = e instanceof Error ? e.message : String(e);
+    void vscode.window.showErrorMessage(`Could not save ${fileName}: ${m}`);
+    return false;
+  }
+}
+
+async function openWorkspaceMdDocFromSidebar(context: vscode.ExtensionContext, fileName: string): Promise<void> {
+  if (!MD_FEATURE_FILES.has(fileName)) return;
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) {
+    void vscode.window.showWarningMessage(
+      'Open a workspace folder to use md notes (files are created under md/ in the workspace).'
+    );
+    return;
+  }
+  const content = await readOrCreateWorkspaceMd(context.extensionUri, ws.uri, fileName);
+  let inst = getGraphPanel()?.instance;
+  const mapViewWasOpen = !!inst;
+  if (!inst) {
+    await createAndOpenEmptyGraph(context, false);
+    inst = getGraphPanel()?.instance;
+  }
+  if (!inst) return;
+  inst.reveal();
+  const delayBeforeSlideMs = mapViewWasOpen ? 80 : 520;
+  setTimeout(() => {
+    inst?.postWebviewMessage({ type: 'cmd:openMdPanel', fileName, content });
+  }, delayBeforeSlideMs);
+}
+
 function ensureTraceSelectionDecorationType(context: vscode.ExtensionContext): vscode.TextEditorDecorationType {
   if (!tracedSelectionDecorationType) {
     tracedSelectionDecorationType = vscode.window.createTextEditorDecorationType({
@@ -149,6 +244,9 @@ function applyTraceSelectionDecoration(
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  initMcpRunnerTerminalReaper(context);
+  registerExplorerMapMcpDefinitionProvider(context, () => provideExplorerMapMcpDefinitions(context));
+  void syncProgrammaticMcpStateWithLegacyFiles(context);
   fileDropProvider = new FileDropTreeProvider(context);
   searchSidebarProvider = new SearchSidebarViewProvider(context.extensionUri, {
     listSavedGraphsForSidebar: () => listSavedGraphs(),
@@ -168,6 +266,7 @@ export function activate(context: vscode.ExtensionContext) {
       useLlm: fileDropProvider.useLlm,
       saved: listSavedGraphs(),
       tree: await buildWorkspaceTree(params),
+      mcp: getMcpPanelSnapshot(context),
     }),
     onToggleLlm: async () => {
       fileDropProvider.toggleUseLlm();
@@ -204,8 +303,37 @@ export function activate(context: vscode.ExtensionContext) {
       pendingGraphPlacement = null;
       getGraphPanel()?.instance?.postWebviewMessage({ type: 'cmd:placementFailed' });
     },
+    onToggleConnectImports: () => {
+      getGraphPanel()?.instance?.postWebviewMessage({ type: 'cmd:toggleConnectImports' });
+    },
+    onOpenMdDoc: async (fileName: string) => {
+      await openWorkspaceMdDocFromSidebar(context, fileName);
+    },
+    onMcpCopyConfig: () => copyCursorMcpConfigToClipboard(context),
+    onMcpRevealMcpHandler: () => revealMcpHandlerFolderInOs(context),
+    onMcpOpenReadme: () => openMcpReadme(context),
+    onMcpOpenRunnerTerminal: async () => {
+      openMcpRunnerTerminal(
+        context,
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null
+      );
+    },
+    onMcpSetEnabled: async (enabled) => {
+      try {
+        await setExplorerMapMcpEnabled(context, enabled);
+      } finally {
+        searchSidebarProvider?.postMcpPanelSnapshot(getMcpPanelSnapshot(context));
+      }
+    },
   });
   context.subscriptions.push(vscode.window.registerWebviewViewProvider('apiGraphVisualizer.fileDropTree', searchSidebarProvider));
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('apiGraphVisualizer.mcp')) {
+        searchSidebarProvider?.postMcpPanelSnapshot(getMcpPanelSnapshot(context));
+      }
+    })
+  );
 
   const maybeViewVisibilityListener = fileDropTreeView
     ? fileDropTreeView.onDidChangeVisibility((e) => {
@@ -234,6 +362,12 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.toggleFileGraphLlm', () => {
       fileDropProvider.toggleUseLlm();
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.copyMcpServerConfig', () => {
+      void copyCursorMcpConfigToClipboard(context);
+    }),
+    vscode.commands.registerCommand('apiGraphVisualizer.openMcpReadme', () => {
+      void openMcpReadme(context);
     }),
     vscode.commands.registerCommand('apiGraphVisualizer.openBacktrackedGraphsFolder', async () => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -342,6 +476,11 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  registerMcpOpenMapFileWatcher(context, async (absPath) => {
+    await loadAndShowFileGraph(context, absPath, 'newWindow');
+    getGraphPanel()?.instance?.reveal();
+  });
 
   // Graph opens only from this extension's actions (tree click/commands), not Explorer/editor focus.
 }
@@ -452,7 +591,14 @@ async function createAndOpenEmptyGraph(context: vscode.ExtensionContext, startRe
   const graphData: GraphData = {
     routeNames: ['Graph'],
     graphSnapshots: {
-      Graph: { nodes: [], edges: [] },
+      Graph: {
+        nodes: [],
+        edges: [],
+        methodDeps: {},
+        controllerMethods: {},
+        defaultMethodId: null,
+        controllerId: null,
+      },
     },
   };
   lastJsonPath = undefined;
@@ -1498,6 +1644,13 @@ function graphPanelHooks(context: vscode.ExtensionContext) {
     },
     onConnectNodes: (payload: { fromNodeId: string; toNodeId: string; routeId: string; sourceJsonPath: string }) => {
       void connectGraphNodes(payload.fromNodeId, payload.toNodeId, payload.routeId, payload.sourceJsonPath);
+    },
+    onGraphSidebarState: (payload: { showConnectImports: boolean; connectLabel: string; connectActive: boolean }) => {
+      searchSidebarProvider.postGraphConnectImportsState(payload);
+    },
+    onSaveMdFile: async (payload: { fileName: string; content: string }) => {
+      const ok = await saveWorkspaceMdFile(context.extensionUri, payload.fileName, payload.content);
+      getGraphPanel()?.instance?.postWebviewMessage({ type: 'cmd:mdFileSaveResult', fileName: payload.fileName, ok });
     },
     onSaveSession: (payload: {
       sourceJsonPath: string;
